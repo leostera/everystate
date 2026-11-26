@@ -622,3 +622,37 @@ equal and 20 MB higher (ReadRepair with 6 faults 175 -> 195 MB, MCBakery 356 -> 
 worker it is lower on the actor models (OrSet with 4 faults 386 -> 320 MB) and within 4 MB elsewhere.
 With 4 workers each worker measures its own units on its own share of the states, so the gain is smaller
 than with one.
+
+## The search on value ids (2026-11-26)
+
+Values are hash-consed and the search works on their ids; design, validation and every number in
+[`docs/rfds/RFD0001-search-on-value-ids.md`](docs/rfds/RFD0001-search-on-value-ids.md). Apple M4 Pro
+(8 performance + 4 efficiency cores, 48 GB), whole processes, builds interleaved round by round;
+raw runs in `bench/search/*.json` (`scripts/bench-search.ts`), tables and charts generated from them
+(`scripts/plot-bench.ts`; `bench/search/README.md` has the commands). Each step is a commit of branch
+`perf/interned-values`: 28fd7c5 (0.4.1), afa9e05 (interning), db119b1 (step cache and one-worker search
+on ids), e1cf1ce (workers on ids, merge overlapping them, immediate integers).
+
+**The five larger models** (CPU seconds on 1 worker, wall seconds on 8; median of 5)
+
+| model | distinct | 1 worker 28fd7c5 | afa9e05 | db119b1 | e1cf1ce | ratio | 8 workers 28fd7c5 | e1cf1ce | ratio | RSS MB 1 worker before / after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| OrSet-fixed-f1 | 129,242 | 0.486 | 0.503 | 0.197 | 0.200 | 2.43x | 0.182 | 0.080 | 2.28x | 82 / 24 |
+| OrSet-fixed-f4 | 524,832 | 2.04 | 2.16 | 0.731 | 0.761 | 2.67x | 0.528 | 0.237 | 2.23x | 314 / 86 |
+| ReadRepair-fixed-f6 | 383,579 | 1.69 | 1.93 | 0.873 | 0.861 | 1.97x | 0.386 | 0.201 | 1.92x | 204 / 59 |
+| LostUpdate-fixed-f6 | 420,646 | 1.38 | 1.51 | 0.644 | 0.676 | 2.03x | 0.320 | 0.175 | 1.83x | 201 / 55 |
+| LeaseLock-fixed-f5 | 122,728 | 0.408 | 0.453 | 0.197 | 0.205 | 1.99x | 0.141 | 0.064 | 2.20x | 68 / 25 |
+| **total** | | 6.00 | 6.55 | 2.64 | 2.70 | 2.22x | 1.56 | 0.757 | 2.06x | |
+
+![five larger models, 1 worker](bench/search/large5-w1.svg)
+![five larger models, 8 workers](bench/search/large5-w8.svg)
+
+**The 12 models of the table at the top** (wall seconds, median of 3; `bench/search/bench12.md` has CPU
+and RSS): on 1 worker 45.28 s before, 45.25 s after (1.00x), every model within 3 % (SimpleRegular,
+MCLamportMutex 0.97x; MCBakery 1.05x); on 8 workers 16.88 s before, 9.97 s after (1.69x).
+
+![12 models, 1 worker](bench/search/bench12-w1.svg)
+![12 models, 8 workers](bench/search/bench12-w8.svg)
+
+**The 125 Feynman configurations** (`scripts/feynman-bench.ts`, CPU ms, median of 5): 1,708 ms before,
+1,184 ms after (1.44x), 0 disagreements (`bench/search/corpus125/`).
