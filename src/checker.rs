@@ -1182,7 +1182,7 @@ impl<'a> Checker<'a> {
         let mut own_ids = vec![];
         let cur: &[crate::hashcons::Id] = match cur {
             Some(c) => c,
-            None if self.plans.as_ref().is_some_and(|p| p.caching()) => {
+            None if self.plans.as_ref().is_some_and(|p| p.caching_now()) => {
                 s.with(|v| crate::stepcache::ids_of(&v[..n], &mut own_ids));
                 &own_ids
             }
@@ -1462,10 +1462,14 @@ impl<'a> Checker<'a> {
                                     let r = idrows.borrow();
                                     self.store.push_row(&r.ids[i * nv..(i + 1) * nv], &r);
                                     self.states.push(self.empty.clone());
-                                } else {
+                                } else if self.plans.as_ref().is_some_and(|p| p.caching_now()) {
                                     // a new state keeps canonical values (`hashcons`): shared with every
-                                    // other state that has them, and compared by identity in the step cache
+                                    // other state that has them, and found by id in the step cache
                                     self.states.push(canon_state(&t, nv));
+                                } else {
+                                    // (nothing would look its values up by id: interning them costs ~5%
+                                    // of the search; the step cache interns a state it meets later)
+                                    self.states.push(t.clone());
                                 }
                                 self.parent.push(sid as u32);
                                 self.level.push(lvl + 1);

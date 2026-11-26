@@ -2788,6 +2788,10 @@ impl Plans {
     pub fn caching(&self) -> bool {
         self.cache.is_some()
     }
+    /// The step cache is on and some unit uses it at the moment (the others were measured as not paying).
+    pub fn caching_now(&self) -> bool {
+        self.cache.is_some() && self.units.iter().any(|u| !u.off.get())
+    }
     /// To be called before each state is expanded (the step cache measures the time between such calls).
     #[inline]
     pub fn tick(&self) {
