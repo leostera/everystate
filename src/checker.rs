@@ -138,7 +138,21 @@ impl FpSet {
         if *self.size.get_mut() * 2 >= self.keys.len() {
             self.grow();
         }
-        self.insert(fp, id)
+        let fp = Self::key(fp);
+        let mut i = (fp as usize) & self.mask;
+        loop {
+            let k = *self.keys[i].get_mut();
+            if k == 0 {
+                *self.ids[i].get_mut() = id;
+                *self.keys[i].get_mut() = fp;
+                *self.size.get_mut() += 1;
+                return None;
+            }
+            if k == fp {
+                return Some(*self.ids[i].get_mut());
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     /// `put` while other threads may be reading; Err(()) when the set would have to grow first.
     #[inline]
@@ -170,10 +184,21 @@ impl FpSet {
             i = (i + 1) & self.mask;
         }
     }
-    /// Whether `fp` is in the set.
+    /// Whether `fp` is in the set. (`&mut`: nobody else reads it, so the loads need no ordering.)
     #[inline]
-    pub fn contains(&self, fp: u64) -> bool {
-        self.get(fp).is_some()
+    pub fn contains(&mut self, fp: u64) -> bool {
+        let fp = Self::key(fp);
+        let mut i = (fp as usize) & self.mask;
+        loop {
+            let k = *self.keys[i].get_mut();
+            if k == 0 {
+                return false;
+            }
+            if k == fp {
+                return true;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     /// Whether `more` insertions fit without growing.
     pub fn room(&self, more: usize) -> bool {
