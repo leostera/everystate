@@ -69,6 +69,8 @@ struct Table {
     vals: Vec<Value>,
     /// id -> the node's word (`value_word`)
     words: Vec<u64>,
+    /// id -> what kind of value the node is (`Shape`, packed)
+    shapes: Vec<u32>,
     /// open addressing over ids, 0 = empty
     slots: Vec<u32>,
     mask: usize,
@@ -78,7 +80,7 @@ impl Table {
     fn new() -> Table {
         let epoch = (NEXT_EPOCH.fetch_add(1, Ordering::Relaxed) as u64) << 32;
         EPOCH.with(|e| e.set(epoch));
-        Table { epoch, vals: vec![Value::Undef], words: vec![0], slots: vec![0; 1 << 12], mask: (1 << 12) - 1 }
+        Table { epoch, vals: vec![Value::Undef], words: vec![0], shapes: vec![0], slots: vec![0; 1 << 12], mask: (1 << 12) - 1 }
     }
 
     #[inline]
@@ -147,6 +149,7 @@ impl Table {
         let id = self.vals.len();
         assert!(id < IMMEDIATE as usize, "more than 2^30 distinct values");
         self.slots[slot] = id as u32;
+        self.shapes.push(Shape::of(&node).pack());
         self.vals.push(node);
         self.words.push(w);
         if self.vals.len() * 2 > self.slots.len() {
@@ -325,6 +328,107 @@ pub fn word(id: Id) -> u64 {
         return value_word(&immediate_value(id)).expect("a scalar has a word");
     }
     TABLE.with(|t| t.borrow().words[id as usize])
+}
+
+/// What kind of value a node is, as the word deltas of `stepcache::delta_word` need to know it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape {
+    /// a function (a tuple, record or function), a set (explicit), or anything else
+    pub kind: ShapeKind,
+    /// the number of elements, or of pairs of a function (below 2^28; else the kind is `Other`)
+    pub len: u32,
+    /// a function whose values are all positive integers (a bag)
+    pub bag: bool,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShapeKind {
+    Other,
+    Fcn,
+    Set,
+}
+impl Shape {
+    fn of(v: &Value) -> Shape {
+        let other = Shape { kind: ShapeKind::Other, len: 0, bag: false };
+        let (kind, len, vals): (ShapeKind, usize, &[Value]) = match v {
+            Value::Tuple(t) => (ShapeKind::Fcn, t.len(), &t.e),
+            Value::Record(r) => (ShapeKind::Fcn, r.vals.len(), &r.vals),
+            Value::Fcn(f) => (ShapeKind::Fcn, f.vals.len(), &f.vals),
+            Value::Set(s) => match &s.k {
+                SetK::Enum(e) => (ShapeKind::Set, e.len(), &[]),
+                _ => return other,
+            },
+            _ => return other,
+        };
+        if len >= 1 << 28 {
+            return other;
+        }
+        let bag = kind == ShapeKind::Fcn && vals.iter().all(|x| matches!(x, Value::Int(n) if *n > 0));
+        Shape { kind, len: len as u32, bag }
+    }
+    fn pack(self) -> u32 {
+        (self.len << 4) | ((self.bag as u32) << 2) | self.kind as u32
+    }
+    fn unpack(x: u32) -> Shape {
+        let kind = match x & 3 {
+            1 => ShapeKind::Fcn,
+            2 => ShapeKind::Set,
+            _ => ShapeKind::Other,
+        };
+        Shape { kind, len: x >> 4, bag: x & 4 != 0 }
+    }
+}
+/// The shape of the value with id `id` (an immediate one is a scalar).
+#[inline]
+pub fn shape(id: Id) -> Shape {
+    if id >= IMMEDIATE {
+        return Shape { kind: ShapeKind::Other, len: 0, bag: false };
+    }
+    TABLE.with(|t| Shape::unpack(t.borrow().shapes[id as usize]))
+}
+
+/// This thread's table, reached without a thread-local lookup per access: for loops that ask for many
+/// words and shapes (a thread-local access is a call on macOS). Valid on the thread that made it.
+#[derive(Clone, Copy)]
+pub struct Local(*const RefCell<Table>);
+impl Local {
+    #[inline]
+    pub fn get() -> Local {
+        TABLE.with(|t| Local(t as *const RefCell<Table>))
+    }
+    #[inline]
+    fn t(&self) -> &RefCell<Table> {
+        // SAFETY: the thread-local outlives every use of this pointer, which stays on its thread (`Local`
+        // is neither Send nor Sync, holding a raw pointer)
+        unsafe { &*self.0 }
+    }
+    #[inline]
+    pub fn word(&self, id: Id) -> u64 {
+        if id >= IMMEDIATE {
+            return value_word(&immediate_value(id)).expect("a scalar has a word");
+        }
+        self.t().borrow().words[id as usize]
+    }
+    #[inline]
+    pub fn shape(&self, id: Id) -> Shape {
+        if id >= IMMEDIATE {
+            return Shape { kind: ShapeKind::Other, len: 0, bag: false };
+        }
+        Shape::unpack(self.t().borrow().shapes[id as usize])
+    }
+}
+/// The integer that the id stands for, when it is an immediate integer.
+#[inline]
+pub fn int_of(x: Id) -> Option<i64> {
+    if (IMMEDIATE + 2..NOT_INTERNED).contains(&x) {
+        Some((x - IMMEDIATE - 2) as i64 - IMM_INT)
+    } else {
+        None
+    }
+}
+/// The immediate id of an integer, if it has one.
+#[inline]
+pub fn int_id(i: i64) -> Option<Id> {
+    immediate(&Value::Int(i))
 }
 
 /// Whether `id` is immediate (its value is in it; see `IMMEDIATE`).

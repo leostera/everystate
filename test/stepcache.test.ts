@@ -110,6 +110,26 @@ Next == (\\E k \\in DOMAIN f : Inc(k)) \\/ Swap`,
   assert.equal(r.status, 'ok');
 });
 
+test('a computed bag added to a bag variable: recorded as one change per copy, or read whole', () => {
+  // Reply(m) adds a bag built from the state (one or two copies of each reply), Flood a bag with a
+  // count of 0 (not a proper bag: the operator itself decides), Echo the variable to itself
+  const r = same(
+    'BagAdd',
+    `EXTENDS Naturals, Bags
+VARIABLES net, n
+Init == net = SetToBag({[k |-> 0]}) /\\ n = 0
+Reply(m) == /\\ n < 3 /\\ n' = n + 1
+            /\\ net' = (net (-) SetToBag({m})) (+) [x \\in {[k |-> m.k + 1], [k |-> n + 5]} |-> IF x.k > 4 THEN 2 ELSE 1]
+Flood == n = 1 /\\ n' = 2 /\\ net' = net (+) [x \\in {[k |-> 9]} |-> 0]
+Echo == n = 2 /\\ n' = 3 /\\ net' = net (+) net
+Next == (\\E m \\in DOMAIN net : Reply(m)) \\/ Flood \\/ Echo
+Small == BagCardinality(net) < 40`,
+    'INIT Init\nNEXT Next\nINVARIANT Small',
+  );
+  assert.equal(r.status, 'ok');
+  assert.ok(r.distinct > 10);
+});
+
 test('one worker and four agree on the bag model', () => {
   const one = check('BagNet', {});
   const four = check('BagNet', {}, ['-workers', '4']);

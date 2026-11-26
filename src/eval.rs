@@ -19,18 +19,41 @@ const ANY: u64 = 1;
 /// A (possibly partial) assignment of values to variables. `Undef` marks an unassigned variable.
 /// Interior mutability is confined to `get`/`set`, which never hand out references.
 pub struct StateData {
-    pub id: u64,
+    /// a number no other state of this thread has had (what the evaluator keys its per-state caches on);
+    /// `refill` gives the state a new one
+    id: Cell<u64>,
     vals: UnsafeCell<Vec<Value>>,
+}
+fn next_state_id() -> u64 {
+    NEXT_STATE_ID.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    })
 }
 pub type StateRef = Rc<StateData>;
 impl StateData {
     pub fn new(vals: Vec<Value>) -> StateRef {
-        let id = NEXT_STATE_ID.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
-        Rc::new(StateData { id, vals: UnsafeCell::new(vals) })
+        Rc::new(StateData { id: Cell::new(next_state_id()), vals: UnsafeCell::new(vals) })
+    }
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.id.get()
+    }
+    /// Makes this another state: the values `fill` puts in (all of them), under a new number. Only for a
+    /// state nothing else holds on to but the evaluator (whose state it may be).
+    pub fn refill(&self, fill: impl FnOnce(&mut Vec<Value>)) {
+        let old;
+        {
+            // SAFETY: single-threaded; the vector is not borrowed elsewhere while this runs, and the old
+            // values are dropped after the borrow ends.
+            let v = unsafe { &mut *self.vals.get() };
+            let mut nv = Vec::with_capacity(v.len());
+            fill(&mut nv);
+            old = std::mem::replace(v, nv);
+        }
+        drop(old);
+        self.id.set(next_state_id());
     }
     pub fn blank(n: usize) -> StateRef {
         StateData::new(vec![Value::Undef; n])
@@ -561,7 +584,7 @@ impl Evaluator {
     }
     #[inline]
     fn cur_id(&self) -> u64 {
-        self.cur.borrow().id
+        self.cur.borrow().id()
     }
 
     // ---------- context helpers ----------

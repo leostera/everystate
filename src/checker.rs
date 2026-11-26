@@ -5,6 +5,7 @@ use crate::intern::*;
 use crate::model::*;
 use crate::value::*;
 use std::cmp::Ordering;
+use std::cell::Cell;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -83,15 +84,28 @@ pub struct ParConfig {
 /// still look fingerprints up): a slot's id is stored before its key, which is stored with release
 /// ordering and read with acquire ordering, so a reader that finds a key finds its id. Growing needs
 /// `&mut`, so no reader is left; `put_shared` refuses to insert when it would have to grow.
+///
+/// A large set is cut in `SEGMENTS` segments of consecutive slots, by the top bits of the fingerprint
+/// (`segment`, the same whatever the size of the set), and a fingerprint is looked for in its segment
+/// only (probing wraps around inside it): threads that insert fingerprints of disjoint sets of segments
+/// do not meet (`put_owned`, the parallel search's merge).
 pub struct FpSet {
     keys: Box<[AtomicU64]>, // 0 = empty
     ids: Box<[AtomicU32]>,
     size: AtomicUsize,
     mask: usize,
+    /// slots per segment - 1, and per segment (a set of one segment: `mask` and 0)
+    seg_mask: usize,
+    seg_len: usize,
 }
+/// The segments of a set of at least `SEGMENTED` slots (a smaller one has one segment: a segment of
+/// 1024 slots or more, at most half full, is far from full however its share of the fingerprints
+/// falls).
+pub const SEGMENTS: usize = 64;
+const SEGMENTED: usize = SEGMENTS << 10;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtOrd};
 // (zeroed memory from the allocator, as `vec![0; n]` gets it: the pages are touched only when used)
-fn zeroed_u64(n: usize) -> Box<[AtomicU64]> {
+pub(crate) fn zeroed_u64(n: usize) -> Box<[AtomicU64]> {
     let b = vec![0u64; n].into_boxed_slice();
     // SAFETY: AtomicU64 has the same size, alignment and bit validity as u64
     unsafe { Box::from_raw(Box::into_raw(b) as *mut [AtomicU64]) }
@@ -107,7 +121,43 @@ impl FpSet {
     }
     /// `cap` must be a power of two.
     pub fn with_capacity(cap: usize) -> FpSet {
-        FpSet { keys: zeroed_u64(cap), ids: zeroed_u32(cap), size: AtomicUsize::new(0), mask: cap - 1 }
+        let (seg_mask, seg_len) = Self::segs_for(cap);
+        FpSet { keys: zeroed_u64(cap), ids: zeroed_u32(cap), size: AtomicUsize::new(0), mask: cap - 1, seg_mask, seg_len }
+    }
+    fn segs_for(cap: usize) -> (usize, usize) {
+        if cap >= SEGMENTED { (cap / SEGMENTS - 1, cap / SEGMENTS) } else { (cap - 1, 0) }
+    }
+    /// Whether the set is cut in segments (see `segment`).
+    pub fn segmented(&self) -> bool {
+        self.seg_len > 0
+    }
+    /// The slot where the search for a key starts.
+    #[inline(always)]
+    fn home(&self, key: u64) -> usize {
+        (Self::segment_of(key) * self.seg_len) | (key as usize & self.seg_mask)
+    }
+    #[inline(always)]
+    fn segment_of(key: u64) -> usize {
+        (key >> (64 - SEGMENTS.trailing_zeros())) as usize
+    }
+    /// The slot after `i` in its segment.
+    #[inline(always)]
+    fn next(&self, i: usize) -> usize {
+        (i & !self.seg_mask) | ((i + 1) & self.seg_mask)
+    }
+    /// The segment of `fp` (below `SEGMENTS`) when the set is `segmented`.
+    #[inline]
+    pub fn segment(fp: u64) -> usize {
+        Self::segment_of(Self::key(fp))
+    }
+    /// `put` by one of several threads that insert at once, each into segments no other touches, while
+    /// nobody reads; Err(()) when the set would have to grow first (see `room`).
+    #[inline]
+    pub fn put_owned(&self, fp: u64, id: u32) -> Result<Option<u32>, ()> {
+        if self.size.load(AtOrd::Relaxed) * 2 >= self.keys.len() {
+            return Err(());
+        }
+        Ok(self.insert(fp, id))
     }
     pub fn len(&self) -> usize {
         self.size.load(AtOrd::Relaxed)
@@ -120,7 +170,7 @@ impl FpSet {
     #[inline]
     pub fn get(&self, fp: u64) -> Option<u32> {
         let fp = Self::key(fp);
-        let mut i = (fp as usize) & self.mask;
+        let mut i = self.home(fp);
         loop {
             let k = self.keys[i].load(AtOrd::Acquire);
             if k == 0 {
@@ -129,7 +179,7 @@ impl FpSet {
             if k == fp {
                 return Some(self.ids[i].load(AtOrd::Relaxed));
             }
-            i = (i + 1) & self.mask;
+            i = self.next(i);
         }
     }
     /// Returns the existing id, or None after inserting `id`.
@@ -139,7 +189,7 @@ impl FpSet {
             self.grow();
         }
         let fp = Self::key(fp);
-        let mut i = (fp as usize) & self.mask;
+        let mut i = self.home(fp);
         loop {
             let k = *self.keys[i].get_mut();
             if k == 0 {
@@ -151,7 +201,7 @@ impl FpSet {
             if k == fp {
                 return Some(*self.ids[i].get_mut());
             }
-            i = (i + 1) & self.mask;
+            i = self.next(i);
         }
     }
     /// `put` while other threads may be reading; Err(()) when the set would have to grow first.
@@ -165,11 +215,34 @@ impl FpSet {
         }
         Ok(self.insert(fp, id))
     }
-    /// (only one thread inserts at a time)
+    /// Inserts `fp` (with id 0) unless it is there; whether it was not. For threads that insert at once,
+    /// each into segments no other touches, while nobody reads, into a set with room for all they insert
+    /// (`room`); the size is theirs to update (`add_len`).
+    #[inline]
+    pub fn insert_owned(&self, fp: u64) -> bool {
+        let fp = Self::key(fp);
+        let mut i = self.home(fp);
+        loop {
+            let k = self.keys[i].load(AtOrd::Relaxed);
+            if k == 0 {
+                self.keys[i].store(fp, AtOrd::Relaxed);
+                return true;
+            }
+            if k == fp {
+                return false;
+            }
+            i = self.next(i);
+        }
+    }
+    /// Counts `n` fingerprints that `insert_owned` inserted.
+    pub fn add_len(&self, n: usize) {
+        self.size.fetch_add(n, AtOrd::Relaxed);
+    }
+    /// (only one thread inserts at a time into a segment)
     #[inline]
     fn insert(&self, fp: u64, id: u32) -> Option<u32> {
         let fp = Self::key(fp);
-        let mut i = (fp as usize) & self.mask;
+        let mut i = self.home(fp);
         loop {
             let k = self.keys[i].load(AtOrd::Relaxed);
             if k == 0 {
@@ -181,14 +254,14 @@ impl FpSet {
             if k == fp {
                 return Some(self.ids[i].load(AtOrd::Relaxed));
             }
-            i = (i + 1) & self.mask;
+            i = self.next(i);
         }
     }
     /// Whether `fp` is in the set. (`&mut`: nobody else reads it, so the loads need no ordering.)
     #[inline]
     pub fn contains(&mut self, fp: u64) -> bool {
         let fp = Self::key(fp);
-        let mut i = (fp as usize) & self.mask;
+        let mut i = self.home(fp);
         loop {
             let k = *self.keys[i].get_mut();
             if k == 0 {
@@ -197,26 +270,89 @@ impl FpSet {
             if k == fp {
                 return true;
             }
-            i = (i + 1) & self.mask;
+            i = self.next(i);
         }
+    }
+    /// Whether `fp` is in the set, while one thread may be inserting: a key being inserted may not be
+    /// seen yet (no id is read, so no ordering is needed).
+    #[inline]
+    pub fn has(&self, fp: u64) -> bool {
+        let fp = Self::key(fp);
+        let mut i = self.home(fp);
+        loop {
+            let k = self.keys[i].load(AtOrd::Relaxed);
+            if k == 0 {
+                return false;
+            }
+            if k == fp {
+                return true;
+            }
+            i = self.next(i);
+        }
+    }
+    /// Starts loading the slot where `fp` would be (a lookup of it soon after then waits less).
+    #[inline]
+    pub fn prefetch(&self, fp: u64) {
+        let i = self.home(Self::key(fp));
+        let p = self.keys[i].as_ptr() as *const u8;
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: a prefetch only hints the cache; the address is inside the table
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = p;
     }
     /// Whether `more` insertions fit without growing.
     pub fn room(&self, more: usize) -> bool {
         (self.len() + more) * 2 < self.keys.len()
     }
-    fn grow(&mut self) {
+    pub fn capacity(&self) -> usize {
+        self.keys.len()
+    }
+    /// A set of `cap` slots (a power of two, at least this one's, which is segmented) to be filled with
+    /// this set's fingerprints by `refill_segment`, for every segment; it counts them already.
+    pub(crate) fn empty_like(&self, cap: usize) -> FpSet {
+        debug_assert!(self.segmented() && cap >= self.capacity() && cap.is_power_of_two());
+        let mut s = FpSet::with_capacity(cap);
+        *s.size.get_mut() = self.len();
+        s
+    }
+    /// Puts the fingerprints of segment `seg` of `old` into this set (larger, segmented: they go to the
+    /// same segment). Threads that fill different segments at once do not meet.
+    pub(crate) fn refill_segment(&self, old: &FpSet, seg: usize) {
+        for j in seg * old.seg_len..(seg + 1) * old.seg_len {
+            let k = old.keys[j].load(AtOrd::Relaxed);
+            if k == 0 {
+                continue;
+            }
+            let mut i = self.home(k);
+            while self.keys[i].load(AtOrd::Relaxed) != 0 {
+                i = self.next(i);
+            }
+            self.ids[i].store(old.ids[j].load(AtOrd::Relaxed), AtOrd::Relaxed);
+            self.keys[i].store(k, AtOrd::Relaxed);
+        }
+    }
+    pub(crate) fn grow(&mut self) {
         let cap = self.keys.len() * 2;
         let ok = std::mem::replace(&mut self.keys, zeroed_u64(cap));
         let oi = std::mem::replace(&mut self.ids, zeroed_u32(cap));
         self.mask = cap - 1;
+        (self.seg_mask, self.seg_len) = Self::segs_for(cap);
         for (j, k) in ok.iter().enumerate() {
             let k = k.load(AtOrd::Relaxed);
             if k == 0 {
                 continue;
             }
-            let mut i = (k as usize) & self.mask;
+            let mut i = self.home(k);
             while *self.keys[i].get_mut() != 0 {
-                i = (i + 1) & self.mask;
+                i = self.next(i);
             }
             *self.keys[i].get_mut() = k;
             *self.ids[i].get_mut() = oi[j].load(AtOrd::Relaxed);
@@ -238,11 +374,11 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 #[inline]
-fn var_term(i: usize, word: u64) -> u64 {
+pub(crate) fn var_term(i: usize, word: u64) -> u64 {
     mix64(word ^ (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 #[inline]
-fn fp_finish(sum: u64) -> u64 {
+pub(crate) fn fp_finish(sum: u64) -> u64 {
     mix64(sum ^ 0x243F_6A88_85A3_08D3)
 }
 fn fp_sum(vals: &[Value]) -> R<u64> {
@@ -277,7 +413,15 @@ fn canon_state(s: &StateRef, nv: usize) -> StateRef {
 #[derive(Default)]
 pub(crate) struct ParentTerms {
     term: Vec<u64>,
+    /// the words the terms were made from
+    word: Vec<u64>,
     sum: u64,
+}
+impl ParentTerms {
+    /// What a successor's fingerprint is computed from at a step-cache hit (`compile::cached_rows`).
+    pub(crate) fn fp_ctx<'a>(&'a self, seen: &'a FpSet) -> crate::compile::FpCtx<'a> {
+        crate::compile::FpCtx { seen, ids: crate::hashcons::Local::get(), words: &self.word, terms: &self.term, sum: self.sum, verify: crate::compile::verify_deltas() }
+    }
 }
 
 /// Where `successors_with` puts the successors it finds.
@@ -326,7 +470,8 @@ impl Sink for RowSink<'_> {
 /// Successors as rows of ids (see `stepcache::Rows`); a step-cache hit adds to the same rows directly.
 struct IdSink<'a> {
     rows: &'a std::cell::RefCell<crate::stepcache::Rows>,
-    n: usize,
+    /// where the rows were at the last mark
+    at: Cell<Option<crate::stepcache::RowsMark>>,
 }
 impl Sink for IdSink<'_> {
     fn emit(&mut self, vals: &[Value], _action: u32) {
@@ -334,12 +479,13 @@ impl Sink for IdSink<'_> {
         self.rows.borrow_mut().push_values(vals);
     }
     fn mark(&self) -> usize {
-        self.rows.borrow().act.len()
+        let r = self.rows.borrow();
+        self.at.set(Some(r.mark()));
+        r.len()
     }
-    fn truncate(&mut self, mark: usize) {
-        let mut r = self.rows.borrow_mut();
-        r.ids.truncate(mark * self.n);
-        r.act.truncate(mark);
+    fn truncate(&mut self, _mark: usize) {
+        let m = self.at.get().expect("a mark before truncating");
+        self.rows.borrow_mut().truncate(m);
     }
 }
 
@@ -385,6 +531,22 @@ impl IdStore {
                 }
             }
         }
+    }
+    /// The fingerprint terms of the state whose row is `row` (as `Checker::parent_terms` gets them from
+    /// its values).
+    fn parent_terms(&self, row: &[crate::hashcons::Id], nv: usize, pt: &mut ParentTerms) -> R<()> {
+        use crate::hashcons::NOT_INTERNED;
+        pt.term.resize(nv, 0);
+        pt.word.resize(nv, 0);
+        pt.sum = 0;
+        let ids = crate::hashcons::Local::get();
+        for (k, &x) in row[..nv].iter().enumerate() {
+            let w = if x >= NOT_INTERNED { value_word(&self.opaque[(x - NOT_INTERNED) as usize])? } else { ids.word(x) };
+            pt.word[k] = w;
+            pt.term[k] = var_term(k, w);
+            pt.sum = pt.sum.wrapping_add(pt.term[k]);
+        }
+        Ok(())
     }
     fn values(&self, row: &[crate::hashcons::Id]) -> Vec<Value> {
         use crate::hashcons::NOT_INTERNED;
@@ -727,6 +889,15 @@ impl<'a> Checker<'a> {
     pub(crate) fn eval_report(&self) -> Option<String> {
         self.plans.as_ref().filter(|_| std::env::var_os("EVERYSTATE_EVAL_STATS").is_some()).map(|p| p.report())
     }
+    /// See `Plans::verdicts` and `Plans::adopt`.
+    pub(crate) fn verdicts(&self) -> Vec<crate::compile::Verdict> {
+        self.plans.as_ref().map(|p| p.verdicts()).unwrap_or_default()
+    }
+    pub(crate) fn adopt(&self, vs: &[crate::compile::Verdict]) {
+        if let Some(p) = &self.plans {
+            p.adopt(vs);
+        }
+    }
     /// The step cache is on: successors can be found as rows of ids (`successors_ids`).
     pub(crate) fn caching(&self) -> bool {
         self.plans.as_ref().is_some_and(|p| p.caching())
@@ -736,14 +907,36 @@ impl<'a> Checker<'a> {
     pub(crate) fn parent_terms(&self, s: &StateRef, pt: &mut ParentTerms) -> R<()> {
         let nv = self.nvars;
         pt.term.resize(nv, 0);
+        pt.word.resize(nv, 0);
         pt.sum = 0;
         s.with(|pv| {
             for k in 0..nv {
-                pt.term[k] = var_term(k, value_word(&pv[k])?);
+                pt.word[k] = value_word(&pv[k])?;
+                pt.term[k] = var_term(k, pt.word[k]);
                 pt.sum = pt.sum.wrapping_add(pt.term[k]);
             }
             Ok(())
         })
+    }
+    /// `parent_terms` of the state whose variables have the ids `cur` (all interned).
+    pub(crate) fn id_terms(&self, cur: &[crate::hashcons::Id], pt: &mut ParentTerms) -> R<()> {
+        let nv = self.nvars;
+        pt.term.resize(nv, 0);
+        pt.word.resize(nv, 0);
+        pt.sum = 0;
+        let ids = crate::hashcons::Local::get();
+        for k in 0..nv {
+            debug_assert!(cur[k] < crate::hashcons::NOT_INTERNED);
+            pt.word[k] = ids.word(cur[k]);
+            pt.term[k] = var_term(k, pt.word[k]);
+            pt.sum = pt.sum.wrapping_add(pt.term[k]);
+        }
+        Ok(())
+    }
+    /// The row of a successor that `successors_ids` noted as a recipe (see `compile::cached_rows`), into
+    /// `row`; false when its changes do not apply after all.
+    pub(crate) fn build_recipe(&self, r: &crate::stepcache::Recipe, cur: &[crate::hashcons::Id], row: &mut Vec<crate::hashcons::Id>) -> bool {
+        self.plans.as_ref().is_some_and(|p| p.build_recipe(self.ev, r, cur, self.nvars, row))
     }
     /// The fingerprint of a successor of `s` given as a row of variables (no VIEW, no SYMMETRY): the
     /// fingerprint of `s` with the terms of the changed variables replaced. Equal to `fingerprint` of the
@@ -770,7 +963,12 @@ impl<'a> Checker<'a> {
         out.clear();
         crate::hashcons::with_ids(|ids| {
             s.with(|pv| {
-                for row in rows.ids.chunks_exact(nv) {
+                for ri in 0..rows.len() {
+                    if rows.meta.found[ri].fp != 0 {
+                        out.push(Some(rows.meta.found[ri].fp));
+                        continue;
+                    }
+                    let row = rows.row(ri, nv).expect("a successor without a fingerprint has a row");
                     let mut sum = pt.sum;
                     let mut ok = true;
                     for k in 0..nv {
@@ -1144,33 +1342,39 @@ impl<'a> Checker<'a> {
 
     // Successors of one state, as (state, action index) pairs in action order.
     pub fn successors(&self, s: &StateRef, out: &mut Vec<StateRef>, out_act: &mut Vec<u32>) -> R<()> {
-        self.successors_with(s, None, None, &mut StateSink { out, act: out_act })
+        self.successors_with(s, None, None, None, None, &mut StateSink { out, act: out_act })
     }
     /// As `successors`, without allocating a state per successor: the variables of each successor are
     /// appended to `out` (`nvars` values per successor).
     pub(crate) fn successors_flat(&self, s: &StateRef, out: &mut Vec<Value>, out_act: &mut Vec<u32>) -> R<()> {
-        self.successors_with(s, None, None, &mut RowSink { out, act: out_act, n: self.nvars })
+        self.successors_with(s, None, None, None, None, &mut RowSink { out, act: out_act, n: self.nvars })
     }
     /// As `successors`, as rows of ids in `rows` (cleared first). `cur` are the ids of `s` as the store
     /// has them; a value that is not interned is renumbered into `rows` (so that a row copied from `cur`
-    /// means what it says).
-    pub(crate) fn successors_ids(&self, s: &StateRef, cur: &mut [crate::hashcons::Id], rows: &std::cell::RefCell<crate::stepcache::Rows>) -> R<()> {
+    /// means what it says). `fill`, when given, puts the state's values into `s` (which does not have them
+    /// yet): it is called only when something has to be evaluated on values. With `fpx`, a successor found
+    /// from a step-cache entry is fingerprinted at once and, when it is a known state, only counted
+    /// (`Rows::dups`).
+    pub(crate) fn successors_ids(&self, s: &StateRef, fill: Option<&dyn Fn()>, cur: &mut [crate::hashcons::Id], rows: &std::cell::RefCell<crate::stepcache::Rows>, fpx: Option<&crate::compile::FpCtx>) -> R<()> {
         use crate::hashcons::NOT_INTERNED;
         {
             let mut r = rows.borrow_mut();
             r.clear();
             for (k, x) in cur.iter_mut().enumerate() {
                 if *x >= NOT_INTERNED {
+                    if let Some(f) = fill {
+                        f();
+                    }
                     r.opaque.push(s.get(k));
                     *x = NOT_INTERNED + (r.opaque.len() - 1) as u32;
                 }
             }
         }
-        self.successors_with(s, Some(cur), Some(rows), &mut IdSink { rows, n: self.nvars })
+        self.successors_with(s, fill, Some(cur), Some(rows), fpx, &mut IdSink { rows, at: Cell::new(None) })
     }
     /// `cur`: the ids of the variables of `s` when known; `rows`: where the sink collects rows of ids, if
     /// it does (a step-cache hit then adds to it directly).
-    fn successors_with(&self, s: &StateRef, cur: Option<&[crate::hashcons::Id]>, rows: Option<&std::cell::RefCell<crate::stepcache::Rows>>, sink: &mut dyn Sink) -> R<()> {
+    fn successors_with(&self, s: &StateRef, fill: Option<&dyn Fn()>, cur: Option<&[crate::hashcons::Id]>, rows: Option<&std::cell::RefCell<crate::stepcache::Rows>>, fpx: Option<&crate::compile::FpCtx>, sink: &mut dyn Sink) -> R<()> {
         if let Some(plans) = &self.plans {
             plans.tick();
         }
@@ -1180,6 +1384,17 @@ impl<'a> Checker<'a> {
         let actions = &m.actions;
         let mut nxt = StateData::blank(n);
         let mut own_ids = vec![];
+        // the state's values, when it does not have them yet
+        let filled = Cell::new(fill.is_none());
+        let have_values = || {
+            if !filled.get() {
+                filled.set(true);
+                (fill.unwrap())();
+            }
+        };
+        if cur.is_none() {
+            have_values();
+        }
         let cur: &[crate::hashcons::Id] = match cur {
             Some(c) => c,
             None if self.plans.as_ref().is_some_and(|p| p.caching_now()) => {
@@ -1190,21 +1405,59 @@ impl<'a> Checker<'a> {
         };
         for (ai, a) in actions.iter().enumerate() {
             if let Some(r) = rows {
-                r.borrow_mut().cur_act = ai as u32;
+                r.borrow_mut().meta.cur_act = ai as u32;
             }
             // The buffer is all-unassigned again after an enumeration; reuse it unless a lazy value kept a
             // reference to it (ours plus the evaluator's make two).
             if Rc::strong_count(&nxt) > 2 {
                 nxt = StateData::blank(n);
             }
-            ev.set_state(s, Some(&nxt));
             ev.init_mode.set(false);
             ev.prime_depth.set(0);
             ev.call_depth.set(0);
             ev.n_assigned.set(0);
-            if let (Some(plans), false) = (&self.plans, ev.steps.enabled.get()) {
+            let mut compiled = true;
+            if let (Some(plans), false, Some(r)) = (&self.plans, ev.steps.enabled.get(), rows) {
+                if plans.has_skel(ai) && !cur.is_empty() {
+                    // the action runs on ids; the state's values are made when something needs them
+                    let mark = sink.mark();
+                    let set = Cell::new(false);
+                    let vals = || {
+                        if !set.get() {
+                            set.set(true);
+                            have_values();
+                            ev.set_state(s, Some(&nxt));
+                        }
+                    };
+                    let attempt = plans.run_skel(ev, ai, s, cur, &nxt, n, r, fpx, &vals, &mut || {
+                        if !nxt.all_defined(n) {
+                            // (the tree-walker, run again below, words the error)
+                            return Err(Box::new(Fail::Check { status: "incomplete", message: String::new() }));
+                        }
+                        nxt.with(|v| sink.emit(&v[..n], ai as u32));
+                        Ok(())
+                    });
+                    match attempt {
+                        Some(Ok(())) => continue,
+                        Some(Err(_)) => {
+                            // as for a failed compiled attempt below: the tree-walker evaluates the action
+                            sink.truncate(mark);
+                            nxt = StateData::blank(n);
+                            ev.init_mode.set(false);
+                            ev.prime_depth.set(0);
+                            ev.call_depth.set(0);
+                            ev.n_assigned.set(0);
+                            compiled = false;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            have_values();
+            ev.set_state(s, Some(&nxt));
+            if let (Some(plans), false, true) = (&self.plans, ev.steps.enabled.get(), compiled) {
                 let mark = sink.mark();
-                let attempt = plans.run_action(ev, ai, s, cur, &nxt, n, rows, &mut || {
+                let attempt = plans.run_action(ev, ai, s, cur, &nxt, n, rows, fpx, &mut || {
                     if !nxt.all_defined(n) {
                         // (the tree-walker, run again below, words the error)
                         return Err(Box::new(Fail::Check { status: "incomplete", message: String::new() }));
@@ -1315,6 +1568,9 @@ impl<'a> Checker<'a> {
         let idmode = self.idmode;
         let mut cur_ids: Vec<crate::hashcons::Id> = vec![];
         let idrows = std::cell::RefCell::new(crate::stepcache::Rows::default());
+        // the row of a successor noted as a recipe (`compile::cached_rows`), when it is a new state
+        let mut recipe_row: Vec<crate::hashcons::Id> = vec![];
+        let mut idbuf = StateData::blank(nv);
         let mut row_fps: Vec<Option<u64>> = vec![];
         let record = self.opts.record_graph;
         let ev = self.ev;
@@ -1342,7 +1598,12 @@ impl<'a> Checker<'a> {
             let s = if idmode {
                 cur_ids.clear();
                 cur_ids.extend_from_slice(self.store.row(sid));
-                self.store.state(sid)
+                // the values of the state are made only if something needs them (`fill`), in a buffer that
+                // is reused unless something kept it (ours plus the evaluator's make two)
+                if Rc::strong_count(&idbuf) > 2 {
+                    idbuf = StateData::blank(nv);
+                }
+                idbuf.clone()
             } else {
                 self.states[sid].clone()
             };
@@ -1353,8 +1614,20 @@ impl<'a> Checker<'a> {
             succ_act.clear();
             rows.clear();
             let generated = if idmode {
-                let r = self.successors_ids(&s, &mut cur_ids, &idrows);
-                succ_act.extend_from_slice(&idrows.borrow().act);
+                let r = match self.store.parent_terms(&cur_ids, nv, &mut pterms) {
+                    Ok(()) => {
+                        let store = &self.store;
+                        let fill = || {
+                            let row = store.row(sid);
+                            s.refill(|v| v.extend(store.values(row)));
+                        };
+                        // (a graph is recorded with every successor's id: none is dropped)
+                        let fpx = pterms.fp_ctx(&self.fps);
+                        self.successors_ids(&s, Some(&fill), &mut cur_ids, &idrows, if record { None } else { Some(&fpx) })
+                    }
+                    Err(e) => Err(e),
+                };
+                succ_act.extend(idrows.borrow().meta.found.iter().map(|f| f.act));
                 r
             } else if flat {
                 self.successors_flat(&s, &mut rows, &mut succ_act)
@@ -1376,28 +1649,69 @@ impl<'a> Checker<'a> {
             let extra = ev.extra_generated.replace(0);
             self.generated += extra;
             let mut fresh = 0u32;
-            if flat && !succ_act.is_empty() {
+            if idmode && !succ_act.is_empty() {
+                // (`pterms` are the parent's, from its ids: see above)
+                self.id_fingerprints(&s, &cur_ids, &pterms, &idrows.borrow(), &mut row_fps);
+            } else if flat && !succ_act.is_empty() {
                 if let Err(e) = self.parent_terms(&s, &mut pterms) {
                     return self.error(self.describe_err(&e, true), Some(self.trace_to(sid)));
                 }
-                if idmode {
-                    self.id_fingerprints(&s, &cur_ids, &pterms, &idrows.borrow(), &mut row_fps);
+            }
+            if idmode && !succ_act.is_empty() {
+                // (the lookups of the seen set below miss the cache: start them all now; those of the
+                // successors noted as recipes were started when they were found)
+                let r = idrows.borrow();
+                for (fp, f) in row_fps.iter().zip(r.meta.found.iter()) {
+                    if let Some(fp) = fp.filter(|_| f.src < crate::stepcache::RECIPE) {
+                        self.fps.prefetch(fp);
+                    }
                 }
             }
-            for i in 0..succ_act.len() {
+            let mut next = 0;
+            while next < succ_act.len() {
+                let i = next;
+                next += 1;
                 let ai = succ_act[i] as usize;
-                self.generated += 1;
-                ev.stats.generated.set(self.generated as i64);
                 let mut known_fp: Option<u64> = None;
                 let t = if idmode {
+                    if row_fps[i].is_some_and(|fp| self.fps.contains(fp)) {
+                        self.generated += 1;
+                        continue;
+                    }
+                    // a new state (or one to be told so from its values): its row, built now if it is a
+                    // recipe
+                    let built = {
+                        let r = idrows.borrow();
+                        match r.meta.recipe_of(i) {
+                            None => true,
+                            Some(rc) => self.build_recipe(rc, &cur_ids, &mut recipe_row),
+                        }
+                    };
+                    if !built {
+                        // (its changes did not apply after all: the successors of the state are found
+                        // again, each with its row, in the same order, and this one is taken again)
+                        let store = &self.store;
+                        let fill = || {
+                            let row = store.row(sid);
+                            s.refill(|v| v.extend(store.values(row)));
+                        };
+                        if let Err(e) = self.successors_ids(&s, Some(&fill), &mut cur_ids, &idrows, None) {
+                            return self.error(self.describe_err(&e, true), Some(self.trace_to(sid)));
+                        }
+                        assert_eq!(idrows.borrow().len(), succ_act.len(), "the successors of a state, found again");
+                        self.id_fingerprints(&s, &cur_ids, &pterms, &idrows.borrow(), &mut row_fps);
+                        next = i;
+                        continue;
+                    }
+                    self.generated += 1;
+                    let r = idrows.borrow();
+                    let row: &[crate::hashcons::Id] = r.row(i, nv).unwrap_or(&recipe_row);
                     match row_fps[i] {
-                        Some(fp) if self.fps.contains(fp) => continue,
                         Some(fp) if m.invariants.is_empty() => {
                             // a new state that nothing looks at: no values are built for it
                             let nid = self.states.len();
                             self.fps.put(fp, nid as u32);
-                            let r = idrows.borrow();
-                            self.store.push_row(&r.ids[i * nv..(i + 1) * nv], &r);
+                            self.store.push_row(row, &r);
                             self.states.push(self.empty.clone());
                             self.parent.push(sid as u32);
                             self.level.push(lvl + 1);
@@ -1414,9 +1728,9 @@ impl<'a> Checker<'a> {
                         Some(fp) => known_fp = Some(fp),
                         None => {}
                     }
-                    let r = idrows.borrow();
-                    StateData::new(r.ids[i * nv..(i + 1) * nv].iter().map(|&x| r.value(x)).collect())
+                    StateData::new(row.iter().map(|&x| r.value(x)).collect())
                 } else if flat {
+                    self.generated += 1;
                     let row = &rows[i * nv..(i + 1) * nv];
                     match self.row_fingerprint(&s, &pterms, row) {
                         // seen before: nothing else looks at this successor, so no state is built for it
@@ -1426,8 +1740,10 @@ impl<'a> Checker<'a> {
                     }
                     StateData::new(row.to_vec())
                 } else {
+                    self.generated += 1;
                     succs[i].clone()
                 };
+                ev.stats.generated.set(self.generated as i64);
                 let mut in_model = true;
                 let mut unseen = true;
                 let mut id: i64 = -1;
@@ -1460,7 +1776,8 @@ impl<'a> Checker<'a> {
                                 id = nid as i64;
                                 if idmode {
                                     let r = idrows.borrow();
-                                    self.store.push_row(&r.ids[i * nv..(i + 1) * nv], &r);
+                                    let row = r.row(i, nv).unwrap_or(&recipe_row);
+                                    self.store.push_row(row, &r);
                                     self.states.push(self.empty.clone());
                                 } else if self.plans.as_ref().is_some_and(|p| p.caching_now()) {
                                     // a new state keeps canonical values (`hashcons`): shared with every

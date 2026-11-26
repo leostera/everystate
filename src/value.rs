@@ -1106,12 +1106,56 @@ impl Hasher {
         h
     }
 }
-/// The 64-bit word that stands for a value in a hash: a tagged scalar, or the (cached) hash of a composite.
-/// It depends only on the content of the value.
+// The words of composite values are sums (mod 2^64) of one term per element, so that the word of a
+// value changed in a few places is the old word with those terms replaced (`stepcache::delta_word`):
+// - a function (tuple, record or function, whichever its domain makes it: the word does not depend on
+//   which) is `fn_tag(n)` plus `entry_term(word of k, word of f[k])` for each k in its domain;
+// - a set is `set_tag(n)` plus `elem_term(word of e)` for each element e.
+#[inline]
+fn mix_word(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+#[inline]
+pub fn fn_tag(n: usize) -> u64 {
+    mix_word(0x0F17_C710_0000_0008 ^ ((n as u64) << 8))
+}
+#[inline]
+pub fn set_tag(n: usize) -> u64 {
+    mix_word(0x05E7_5E75_0000_0007 ^ ((n as u64) << 8))
+}
+/// The folded 128-bit product of `a` and `b` (as wyhash mixes two words): one multiplication.
+#[inline]
+fn mum(a: u64, b: u64) -> u64 {
+    let m = (a as u128).wrapping_mul(b as u128);
+    (m as u64) ^ ((m >> 64) as u64)
+}
+#[inline]
+pub fn entry_term(wk: u64, wv: u64) -> u64 {
+    mum(wk ^ 0xA076_1D64_78BD_642F, wv ^ 0xE703_7ED1_A0B4_28DB)
+}
+#[inline]
+pub fn elem_term(we: u64) -> u64 {
+    mum(we ^ 0x8EBC_6AF0_9C88_C6E3, 0x5899_65CC_7537_4CC3)
+}
+/// The words of an integer and a string (as `value_word` has them).
+#[inline]
+pub fn int_word(i: i64) -> u64 {
+    1 ^ ((i as u64) << 4)
+}
+#[inline]
+pub fn str_word(s: StrId) -> u64 {
+    str_hash(s).rotate_left(5) ^ 4
+}
+/// The 64-bit word that stands for a value in a hash: a tagged scalar, or the (cached) word of a
+/// composite (see `fn_tag`). It depends only on the content of the value.
 #[inline]
 pub fn value_word(v: &Value) -> R<u64> {
     Ok(match v {
-        Value::Int(i) => 1 ^ ((*i as u64) << 4),
+        Value::Int(i) => int_word(*i),
         Value::Bool(b) => {
             if *b {
                 3
@@ -1119,7 +1163,7 @@ pub fn value_word(v: &Value) -> R<u64> {
                 2
             }
         }
-        Value::Str(s) => str_hash(*s).rotate_left(5) ^ 4,
+        Value::Str(s) => str_word(*s),
         Value::Model(m) => str_hash(*m).rotate_left(11) ^ 9,
         Value::Tuple(t) => {
             let c = t.h.get();
@@ -1162,12 +1206,11 @@ impl Hasher {
             Value::Tuple(t) => {
                 let mut c = t.h.get();
                 if c == 0 {
-                    let mut h = Hasher::new();
-                    h.add(5 ^ ((t.len() as u64) << 4));
-                    for x in t.iter() {
-                        h.value(x)?;
+                    let mut w = fn_tag(t.len());
+                    for (i, x) in t.iter().enumerate() {
+                        w = w.wrapping_add(entry_term(int_word(i as i64 + 1), value_word(x)?));
                     }
-                    c = h.finish();
+                    c = w;
                     t.h.set(c);
                 }
                 self.h = c;
@@ -1175,13 +1218,11 @@ impl Hasher {
             Value::Record(r) => {
                 let mut c = r.h.get();
                 if c == 0 {
-                    let mut h = Hasher::new();
-                    h.add(6 ^ ((r.names.len() as u64) << 4));
+                    let mut w = fn_tag(r.names.len());
                     for i in 0..r.names.len() {
-                        h.add(str_hash(r.names[i]));
-                        h.value(&r.vals[i])?;
+                        w = w.wrapping_add(entry_term(str_word(r.names[i]), value_word(&r.vals[i])?));
                     }
-                    c = h.finish();
+                    c = w;
                     r.h.set(c);
                 }
                 self.h = c;
@@ -1189,22 +1230,22 @@ impl Hasher {
             Value::Set(s) => {
                 let mut c = s.h.get();
                 if c == 0 {
-                    let mut h = Hasher::new();
+                    let mut w;
                     if let SetK::Interval(lo, hi) = &s.k {
-                        // same stream as the enumerated set, without materializing it
+                        // the same as the enumerated set, without materializing it
                         let n = (hi - lo + 1).max(0);
-                        h.add(7 ^ ((n as u64) << 4));
+                        w = set_tag(n as usize);
                         for i in *lo..=*hi {
-                            h.add(1 ^ ((i as u64) << 4));
+                            w = w.wrapping_add(elem_term(int_word(i)));
                         }
                     } else {
                         let e = s.elems()?;
-                        h.add(7 ^ ((e.len() as u64) << 4));
+                        w = set_tag(e.len());
                         for x in e {
-                            h.value(x)?;
+                            w = w.wrapping_add(elem_term(value_word(x)?));
                         }
                     }
-                    c = h.finish();
+                    c = w;
                     s.h.set(c);
                 }
                 self.h = c;
@@ -1212,13 +1253,11 @@ impl Hasher {
             Value::Fcn(f) => {
                 let mut c = f.h.get();
                 if c == 0 {
-                    let mut h = Hasher::new();
-                    h.add(8 ^ ((f.dom.len() as u64) << 4));
+                    let mut w = fn_tag(f.dom.len());
                     for i in 0..f.dom.len() {
-                        h.value(&f.dom[i])?;
-                        h.value(&f.vals[i])?;
+                        w = w.wrapping_add(entry_term(value_word(&f.dom[i])?, value_word(&f.vals[i])?));
                     }
-                    c = h.finish();
+                    c = w;
                     f.h.set(c);
                 }
                 self.h = c;

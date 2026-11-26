@@ -49,6 +49,182 @@ pub struct Cx<'a> {
     /// where successors go as rows of ids, when the caller collects them so (a step-cache hit then adds
     /// its rows directly instead of handing each successor to the continuation)
     pub out: Option<&'a RefCell<sc_::Rows>>,
+    /// when the action runs on ids (`Skel`): builds the current state's values in `cur` and sets the
+    /// evaluator's state, the first time something needs them
+    pub vals: Option<&'a dyn Fn()>,
+    /// a successor found from a step-cache entry is fingerprinted there, and dropped when it is a known
+    /// state
+    pub fpx: Option<&'a FpCtx<'a>>,
+}
+/// What fingerprinting a successor from its parent's ids needs (see `Checker::row_fingerprint`).
+pub struct FpCtx<'a> {
+    pub seen: &'a crate::checker::FpSet,
+    pub ids: crate::hashcons::Local,
+    /// the parent's word and term per variable, and the sum of the terms
+    pub words: &'a [u64],
+    pub terms: &'a [u64],
+    pub sum: u64,
+    /// EVERYSTATE_VERIFY_DELTAS (see `verify_delta`)
+    pub verify: bool,
+}
+
+/// The top of an action as it runs on ids (RFD0002): disjunctions, existential quantifiers over one
+/// variable, LETs and inlined definitions above the units. A state whose units all hit is expanded
+/// without building any of its values.
+enum Skel {
+    Or(Vec<Skel>),
+    Exists {
+        slot: usize,
+        dom: Dom,
+        body: Box<Skel>,
+        /// the quantifier as compiled, for a domain that cannot be taken on ids
+        run: Rc<AE>,
+    },
+    /// entering a LET or an inlined definition: what is done on values before its body
+    Pre { ops: Vec<PreOp>, body: Box<Skel> },
+    Unit(Rc<UnitNode>),
+}
+/// Where an existential quantifier of a skeleton takes its values from.
+enum Dom {
+    /// a set that does not depend on the state or on any bound variable: evaluated once
+    Const { set: Rc<CE>, ids: OnceCell<Option<Box<[crate::hashcons::Id]>>> },
+    /// `DOMAIN v`, `v` a variable
+    Domain(usize),
+}
+/// A unit (see `Comp::unit`): what it depends on besides the state, and its compiled code.
+struct UnitNode {
+    id: u32,
+    /// the slots of the variables bound by the quantifiers above it
+    bound: Vec<usize>,
+    /// slots of by-name bindings, computed again inside it when it is recorded
+    clear: Vec<usize>,
+    inner: AE,
+    stat: Rc<UnitStat>,
+    n: N,
+}
+/// A step of the way from the top of a skeleton to a unit, replayed on values when the unit needs them.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Bind(usize, crate::hashcons::Id),
+    Pre(&'a [PreOp]),
+}
+/// The steps from the top of a skeleton to where it is being run. (A skeleton deeper than this has none.)
+const PATH_MAX: usize = 24;
+struct Path<'a> {
+    n: usize,
+    /// (the first `n` are set: an action runs its skeleton once per state, and this is not cleared)
+    a: [std::mem::MaybeUninit<Step<'a>>; PATH_MAX],
+}
+impl<'a> Path<'a> {
+    #[inline]
+    fn new() -> Path<'a> {
+        Path { n: 0, a: [std::mem::MaybeUninit::uninit(); PATH_MAX] }
+    }
+    #[inline]
+    fn push(&mut self, s: Step<'a>) {
+        self.a[self.n].write(s);
+        self.n += 1;
+    }
+    #[inline]
+    fn pop(&mut self) {
+        self.n -= 1;
+    }
+    #[inline]
+    fn steps(&self) -> impl Iterator<Item = &Step<'a>> {
+        // SAFETY: the first `n` steps were written by `push`
+        self.a[..self.n].iter().map(|s| unsafe { s.assume_init_ref() })
+    }
+}
+impl Skel {
+    fn depth(&self) -> usize {
+        match self {
+            Skel::Or(items) => items.iter().map(Skel::depth).max().unwrap_or(0),
+            Skel::Exists { body, .. } | Skel::Pre { body, .. } => 1 + body.depth(),
+            Skel::Unit(_) => 0,
+        }
+    }
+}
+
+/// Runs a skeleton on the current state's ids (see `Plans::run_skel`).
+fn skel_run<'s>(sk: &'s Skel, cx: &Cx, path: &mut Path<'s>, bids: &mut SmallIds, k: &mut dyn FnMut() -> R<()>) -> R<()> {
+    match sk {
+        Skel::Or(items) => {
+            for it in items {
+                skel_run(it, cx, path, bids, k)?;
+            }
+            Ok(())
+        }
+        Skel::Pre { ops, body } => {
+            path.push(Step::Pre(ops));
+            let r = skel_run(body, cx, path, bids, k);
+            path.pop();
+            r
+        }
+        Skel::Exists { slot, dom, body, run } => {
+            use crate::hashcons as hc;
+            let n0 = bids.n;
+            let each = |x: crate::hashcons::Id, path: &mut Path<'s>, bids: &mut SmallIds, k: &mut dyn FnMut() -> R<()>| -> R<()> {
+                // (a skeleton has at most PATH_MAX steps, so its bound variables fit)
+                bids.push(x);
+                path.push(Step::Bind(*slot, x));
+                let r = skel_run(body, cx, path, bids, k);
+                path.pop();
+                bids.n = n0;
+                r
+            };
+            match dom {
+                Dom::Domain(var) => {
+                    let d = cx.cache.and_then(|t| t.borrow().domain_ids(cx.cur_ids[*var]));
+                    if let Some(d) = d {
+                        for &x in d.iter() {
+                            each(x, path, bids, k)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                Dom::Const { set, ids } => {
+                    let got = ids.get_or_init(|| {
+                        on_values(cx, path);
+                        let s = as_set(set(cx).ok()?).ok()?;
+                        if let SetK::Interval(lo, hi) = &s.k {
+                            return (*lo..=*hi).map(|i| hc::id(&Value::Int(i))).collect();
+                        }
+                        s.elems().ok()?.iter().map(hc::id).collect()
+                    });
+                    if let Some(xs) = got {
+                        for &x in xs.iter() {
+                            each(x, path, bids, k)?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            // (the quantifier as compiled says what this domain is, or what is wrong with it)
+            on_values(cx, path);
+            run(cx, k)
+        }
+        Skel::Unit(u) => {
+            let table = cx.cache.expect("a skeleton runs with the step cache on");
+            if !use_cache(cx, &u.stat) {
+                on_values(cx, path);
+                return (u.inner)(cx, k);
+            }
+            unit_cached(cx, k, table, u, bids.as_slice(), &|| on_values(cx, path))
+        }
+    }
+}
+/// The state's values in `cur`, the evaluator's state set, and the frame as the closures above the
+/// current point of the skeleton would have left it.
+fn on_values(cx: &Cx, path: &Path) {
+    if let Some(v) = cx.vals {
+        v();
+    }
+    for st in path.steps() {
+        match st {
+            Step::Bind(slot, x) => cx.f.set(*slot, crate::hashcons::value(*x)),
+            Step::Pre(ops) => run_pre(ops, cx),
+        }
+    }
 }
 /// What the evaluation of a unit read and did, noted for the step cache.
 #[derive(Default)]
@@ -118,6 +294,9 @@ fn uses_at(n: N) -> bool {
     r
 }
 type CE = Box<dyn Fn(&Cx) -> R<Value>>;
+/// The most copies a bag added to a variable's bag may have for the step cache to record the addition as
+/// changes (`Comp::builtin`, B (+) C).
+const BAG_DELTA_MAX: i64 = 64;
 type AE = Box<dyn Fn(&Cx, &mut dyn FnMut() -> R<()>) -> R<()>>;
 
 #[cold]
@@ -194,7 +373,7 @@ fn build(sc: &Rc<Sc>, cx: &Cx, share: bool) -> R<C> {
                                 if cn.name == d.name {
                                     if let Bind::LetLazy { v: cell, st, .. } = &cn.val {
                                         *cell.borrow_mut() = v;
-                                        st.set(cx.cur.id);
+                                        st.set(cx.cur.id());
                                     }
                                     break;
                                 }
@@ -424,6 +603,10 @@ struct Comp {
     units: u32,
     unit_stats: Vec<Rc<UnitStat>>,
     plan_id: u32,
+    /// the skeleton of what `act_inner` just compiled, when it can run on ids (see `Skel`); `skel_out`:
+    /// the one a structural node of `act_inner1` leaves for `act_inner0` to pass on
+    skel: Option<Skel>,
+    skel_out: Option<Skel>,
 }
 pub struct UnitStat {
     loc: Loc4,
@@ -456,6 +639,19 @@ pub struct UnitStat {
     mark_s: Cell<u64>,
 }
 type Loc4 = [u32; 4];
+/// What the measurements of one unit of the step cache concluded (`Plans::verdicts`), with where the
+/// unit is (the plans of one model on two threads have the same units in the same order).
+#[derive(Clone, Copy, Debug)]
+pub struct Verdict {
+    loc: Loc4,
+    kind: VerdictKind,
+}
+#[derive(Clone, Copy, Debug)]
+enum VerdictKind {
+    Unknown,
+    Pays,
+    DoesNotPay { penalty: u64, skip: u64 },
+}
 
 /// The expression just compiled is `{e}` or `SetToBag({e})`, possibly behind inlined definitions:
 /// `elem` computes `e` after the slots in `clear` are reset. Consumers (`S \cup {e}`, `S \ {e}`,
@@ -644,6 +840,28 @@ fn one_bound(b: &'static Bound) -> Option<(Name, N)> {
         _ => None,
     }
 }
+/// `n` does not depend on the state, on a bound variable, a parameter or a LET definition: its value is
+/// the same wherever it is evaluated. (A conservative test: an expression that binds names of its own is
+/// not taken.)
+fn closed_const(n: N) -> bool {
+    fn walk(n: N) -> bool {
+        match &n.e {
+            E::Num(_) | E::Str(..) | E::Bool(_) => true,
+            E::Op(_, a) => a.iter().all(walk),
+            E::App { args, sel: None, r, .. } => {
+                args.iter().all(walk)
+                    && match r.get() {
+                        Res::Decl(d) => !d.is_var,
+                        Res::Def(d) => d.over.get().unwrap_or(d).inst.is_none(),
+                        _ => false,
+                    }
+            }
+            E::Rec(fields, _) => fields.iter().all(|(_, x)| walk(x)),
+            _ => false,
+        }
+    }
+    walk(n) && crate::modules::level_of(n) == 0
+}
 fn var_of(n: N) -> Option<usize> {
     if let E::App { args, sel: None, r, .. } = &n.e {
         if let Res::Decl(d) = r.get() {
@@ -657,7 +875,7 @@ fn var_of(n: N) -> Option<usize> {
 
 impl Comp {
     fn new(cache: bool, plan_id: u32) -> Comp {
-        Comp { nslots: 0, stack: vec![], budget: 20_000, unstable: false, shape: None, shape_ok: false, dshape: None, dshape_ok: false, cache, top: false, descend: false, cache_slots: vec![], top_slots: vec![], units: 0, unit_stats: vec![], plan_id }
+        Comp { nslots: 0, stack: vec![], budget: 20_000, unstable: false, shape: None, shape_ok: false, dshape: None, dshape_ok: false, cache, top: false, descend: false, cache_slots: vec![], top_slots: vec![], units: 0, unit_stats: vec![], plan_id, skel: None, skel_out: None }
     }
     /// The compiled bounds of a quantifier and the scope of its body. None when a bound has no set.
     fn bounds(&mut self, bounds: &'static [Bound], sc: &Rc<Sc>) -> Option<(Bnds, Rc<Sc>)> {
@@ -1477,6 +1695,45 @@ impl Comp {
                     });
                 }
             }
+            if let (Some(d), true) = (first_d, opname.as_ref() == "\\oplus") {
+                // B (+) C, C any bag: for the step cache, C's elements added to B one at a time (what
+                // `bag_one` does), so that B is not read whole; C must be a small proper bag
+                let mut it = ces.into_iter();
+                let (b, c) = (it.next().unwrap(), Rc::new(it.next().unwrap()));
+                let c2 = c.clone();
+                self.dshape = Some(DShape {
+                    var: d.var,
+                    direct: false,
+                    prog: Rc::new(move |cx, ops| {
+                        if !(d.prog)(cx, ops)? {
+                            return Ok(false);
+                        }
+                        let cv = c2(cx)?;
+                        if !crate::value::is_fcn(&cv) {
+                            return Ok(false);
+                        }
+                        let (es, ns) = (crate::value::domain_elems(&cv)?, crate::value::fcn_values(&cv)?);
+                        let mut total = 0;
+                        for (e, k) in es.iter().zip(ns) {
+                            let Value::Int(k) = k else { return Ok(false) };
+                            total += *k;
+                            if *k < 1 || total > BAG_DELTA_MAX {
+                                return Ok(false);
+                            }
+                            for _ in 0..*k {
+                                ops.push(DOp::Bag { e: e.clone(), plus: true });
+                            }
+                        }
+                        Ok(true)
+                    }),
+                });
+                self.dshape_ok = true;
+                return Box::new(move |cx| {
+                    let bv = b(cx)?;
+                    let cv = c(cx)?;
+                    cx.ev.call_builtin(bi, &[bv, cv])
+                });
+            }
         }
         if bi.arith != 0 && ces.len() == 2 {
             let mut it = ces.into_iter();
@@ -1798,7 +2055,9 @@ impl Comp {
     fn act_inner(&mut self, n: N, sc: &Rc<Sc>) -> AE {
         let top = std::mem::replace(&mut self.top, false);
         if !top || !self.cache {
-            return self.act_inner0(n, sc);
+            let r = self.act_inner0(n, sc);
+            self.skel = None;
+            return r;
         }
         let structural = match &n.e {
             E::Op(K::Or, _) | E::Let { .. } | E::Quant { forall: false, .. } => true,
@@ -1825,9 +2084,20 @@ impl Comp {
         self.units += 1;
         let stat = Rc::new(UnitStat { loc: n.loc, lookups: Cell::new(0), hits: Cell::new(0), off: Cell::new(false), skip: Cell::new(0), penalty: Cell::new(0), phase: Cell::new(PH_WARM), count: Cell::new(0), acc: Default::default(), seen: Cell::new(0), arm: Cell::new(false), last: Cell::new((0.0, 0.0)), trials: Cell::new(0), again: Cell::new(1 << 20), held: Cell::new(false), mark: Cell::new(0), mark_l: Cell::new(0), stored: Cell::new(0), mark_s: Cell::new(0) });
         self.unit_stats.push(stat.clone());
-        Box::new(move |cx, k| unit_run(cx, k, id, &bound, &clear, &inner, &stat, n))
+        let node = Rc::new(UnitNode { id, bound, clear, inner, stat, n });
+        self.skel = Some(Skel::Unit(node.clone()));
+        Box::new(move |cx, k| unit_run(cx, k, &node))
     }
+    /// Compiles `n` above the units (`desc`), leaving its skeleton in `self.skel` when it has one.
     fn act_inner0(&mut self, n: N, sc: &Rc<Sc>) -> AE {
+        let desc = self.descend;
+        self.skel_out = None;
+        let r = self.act_inner1(n, sc);
+        let out = self.skel_out.take();
+        self.skel = if desc { out } else { None };
+        r
+    }
+    fn act_inner1(&mut self, n: N, sc: &Rc<Sc>) -> AE {
         let desc = std::mem::replace(&mut self.descend, false);
         self.budget -= 1;
         if self.budget < 0 {
@@ -1850,13 +2120,20 @@ impl Comp {
                     Box::new(move |cx, k| conj(&items, 0, cx, k))
                 }
                 K::Or => {
+                    let mut sks = Some(vec![]);
                     let items: Vec<AE> = a
                         .iter()
                         .map(|x| {
                             self.top = desc;
-                            self.act_inner(x, sc)
+                            let it = self.act_inner(x, sc);
+                            match (self.skel.take(), &mut sks) {
+                                (Some(s), Some(v)) => v.push(s),
+                                _ => sks = None,
+                            }
+                            it
                         })
                         .collect();
+                    self.skel_out = sks.map(Skel::Or);
                     Box::new(move |cx, k| {
                         for it in &items {
                             it(cx, k)?;
@@ -2051,17 +2328,20 @@ impl Comp {
                         });
                     }
                 };
-                let set = self.expr(set, sc);
+                let set_n = set;
+                let set: Rc<CE> = Rc::new(self.expr(set, sc));
                 let slot = self.slot();
                 self.top = desc;
                 if desc {
                     self.top_slots.push(slot);
                 }
                 let body = self.act_inner(body, &push(sc, ScK::Slot { name: nm, slot }));
+                let body_skel = self.skel.take();
                 if desc {
                     self.top_slots.pop();
                 }
-                Box::new(move |cx, k| {
+                let set2 = set.clone();
+                let run: Rc<AE> = Rc::new(Box::new(move |cx, k| {
                     let s = as_set(set(cx)?)?;
                     if let SetK::Interval(lo, hi) = &s.k {
                         for i in *lo..=*hi {
@@ -2075,7 +2355,16 @@ impl Comp {
                         body(cx, k)?;
                     }
                     Ok(())
-                })
+                }));
+                if let (true, Some(b)) = (desc, body_skel) {
+                    let dom = match &set_n.e {
+                        E::Op(K::Domain, a) if a.len() == 1 && var_of(&a[0]).is_some() => Some(Dom::Domain(var_of(&a[0]).unwrap())),
+                        _ if closed_const(set_n) => Some(Dom::Const { set: set2, ids: OnceCell::new() }),
+                        _ => None,
+                    };
+                    self.skel_out = dom.map(|dom| Skel::Exists { slot, dom, body: Box::new(b), run: run.clone() });
+                }
+                Box::new(move |cx, k| run(cx, k))
             }
             E::Quant { .. } => fb_act(n, sc),
             E::Case { arms, other } => {
@@ -2097,6 +2386,9 @@ impl Comp {
                 Some((inner, clear)) => {
                     self.top = desc;
                     let body = self.act_inner(body, &inner);
+                    if let (true, Some(b)) = (desc, self.skel.take()) {
+                        self.skel_out = Some(Skel::Pre { ops: clear.clone(), body: Box::new(b) });
+                    }
                     Box::new(move |cx, k| {
                         run_pre(&clear, cx);
                         body(cx, k)
@@ -2129,6 +2421,9 @@ impl Comp {
                                 self.top = desc;
                                 let b = self.act_inner(body, &inner);
                                 self.stack.pop();
+                                if let (true, Some(s)) = (desc, self.skel.take()) {
+                                    self.skel_out = Some(Skel::Pre { ops: clear.clone(), body: Box::new(s) });
+                                }
                                 Box::new(move |cx, k| {
                                     run_pre(&clear, cx);
                                     b(cx, k)
@@ -2163,12 +2458,38 @@ impl Comp {
 
 /// A unit with the step cache on: the stored successors when an entry matches the state, else an
 /// evaluation that is recorded and stored.
-#[allow(clippy::too_many_arguments)]
-fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], clear: &[usize], inner: &AE, stat: &Rc<UnitStat>, n: N) -> R<()> {
+fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, u: &UnitNode) -> R<()> {
     let table = match cx.cache {
         Some(t) if !cx.rec_on.get() && cx.ev.n_assigned.get() == 0 => t,
-        _ => return inner(cx, k),
+        _ => return (u.inner)(cx, k),
     };
+    if !use_cache(cx, &u.stat) {
+        return (u.inner)(cx, k);
+    }
+    let nv = cx.nv as usize;
+    if cx.cur_ids.len() < nv {
+        return (u.inner)(cx, k);
+    }
+    let mut bids: SmallIds = SmallIds::new();
+    let all = cx.f.with(|fv| u.bound.iter().all(|&s| matches!(fv.get(s).and_then(crate::hashcons::id), Some(x) if bids.push(x))));
+    if !all {
+        return (u.inner)(cx, k);
+    }
+    unit_cached(cx, k, table, u, bids.as_slice(), &|| {})
+}
+/// Whether this evaluation of the unit goes through the cache (and the bookkeeping of that decision).
+#[inline(always)]
+fn use_cache(cx: &Cx, stat: &Rc<UnitStat>) -> bool {
+    // (the common case: a unit that has the cache, between two looks at how it does)
+    let c = stat.count.get() + 1;
+    if stat.phase.get() == PH_ON && c % 4096 != 0 && !cx.cache_always {
+        stat.count.set(c);
+        return true;
+    }
+    use_cache_slow(cx, stat)
+}
+#[inline(never)]
+fn use_cache_slow(cx: &Cx, stat: &Rc<UnitStat>) -> bool {
     // Whether the cache pays is measured, not assumed, and measured on the whole work per state rather
     // than on the unit alone (a successor built from an entry shares its new values with its parent and
     // with the other successors built from that entry, which saves time after the unit, in fingerprinting
@@ -2187,7 +2508,7 @@ fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], cle
     // fails again (up to 4 million evaluations; at once 4 million when it is far from paying).
     if cx.cache_always {
         // EVERYSTATE_STEP_CACHE=always (for testing): every unit uses the cache, whether or not it pays
-        return unit_cached(cx, k, table, id, bound, clear, inner, stat, n);
+        return true;
     }
     let c = stat.count.get() + 1;
     stat.count.set(c);
@@ -2196,7 +2517,7 @@ fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], cle
             if c >= stat.skip.get() {
                 stat.enter(PH_WARM);
             }
-            inner(cx, k)
+            false
         }
         PH_WARM => {
             if c == 1 {
@@ -2216,7 +2537,7 @@ fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], cle
                     stat.begin_trial(cx.meas);
                 }
             }
-            unit_cached(cx, k, table, id, bound, clear, inner, stat, n)
+            true
         }
         PH_TRIAL => {
             let e = cx.meas.exp.get();
@@ -2225,11 +2546,7 @@ fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], cle
                 stat.arm.set((sc_::mix(e, 0x7A11) >> 17) & 1 == 1);
                 cx.meas.touched.borrow_mut().push(stat.clone());
             }
-            if stat.arm.get() {
-                unit_cached(cx, k, table, id, bound, clear, inner, stat, n)
-            } else {
-                inner(cx, k)
-            }
+            stat.arm.get()
         }
         _ => {
             if c % 4096 == 0 {
@@ -2241,7 +2558,7 @@ fn unit_run(cx: &Cx, k: &mut dyn FnMut() -> R<()>, id: u32, bound: &[usize], cle
                     stat.mark_l.set(stat.lookups.get());
                 }
             }
-            unit_cached(cx, k, table, id, bound, clear, inner, stat, n)
+            true
         }
     }
 }
@@ -2377,60 +2694,46 @@ impl UnitStat {
         self.enter(PH_OFF);
     }
 }
-#[allow(clippy::too_many_arguments)]
-fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id: u32, bound: &[usize], clear: &[usize], inner: &AE, stat: &UnitStat, n: N) -> R<()> {
-    let nv = cx.nv as usize;
-    if cx.cur_ids.len() < nv {
-        return inner(cx, k);
-    }
-    let mut bids: SmallIds = SmallIds::new();
-    let all = cx.f.with(|fv| bound.iter().all(|&s| matches!(fv.get(s).and_then(crate::hashcons::id), Some(x) if bids.push(x))));
-    if !all {
-        return inner(cx, k);
-    }
-    let bids = bids.as_slice();
+/// A unit through the cache, with these bound values: the stored successors when an entry matches the
+/// state, else an evaluation that is recorded and stored. `before` is called before anything is evaluated
+/// on values (the skeleton builds them then).
+#[inline(always)]
+fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, u: &UnitNode, bids: &[crate::hashcons::Id], before: &dyn Fn()) -> R<()> {
+    let stat = &u.stat;
     stat.lookups.set(stat.lookups.get() + 1);
-    // 1. an entry whose unit, bound values and located values all match this state
-    let ev = cx.ev;
-    let hit = {
+    // 1. an entry whose unit, bound values and located values all match this state (successors collected
+    // as ids: the rows go straight there)
+    if let Some(out) = cx.out {
         let t = table.borrow();
-        match cx.out {
-            // successors collected as ids: the rows go straight there
-            Some(out) => {
-                let mut o = out.borrow_mut();
-                let mark = o.ids.len();
-                match cached_rows(&t, cx, id, bids, n, &mut o.ids) {
-                    Some(count) => {
-                        let a = o.cur_act;
-                        o.act.extend(std::iter::repeat_n(a, count));
-                        Some(None)
-                    }
-                    None => {
-                        o.ids.truncate(mark);
-                        None
-                    }
-                }
-            }
-            None => {
-                let mut rows = vec![];
-                cached_rows(&t, cx, id, bids, n, &mut rows).map(|_| Some(rows))
-            }
+        let mut o = out.borrow_mut();
+        let mark = o.mark();
+        let o = &mut *o;
+        if cached_rows(&t, cx, u.id, bids, u.n, &mut o.ids, Some(&mut o.meta)).is_some() {
+            // (the table's counts of lookups and hits are those of its units: see `Plans::report`)
+            stat.hits.set(stat.hits.get() + 1);
+            return Ok(());
         }
-    };
-    if let Some(rows) = hit {
-        stat.hits.set(stat.hits.get() + 1);
-        {
-            let mut t = table.borrow_mut();
-            t.n.lookups += 1;
-            t.n.hits += 1;
+        o.truncate(mark);
+    }
+    unit_cached_values(cx, k, table, u, bids, before)
+}
+/// `unit_cached` past an entry for the ids: successors as values, or a miss.
+#[inline(never)]
+fn unit_cached_values(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, u: &UnitNode, bids: &[crate::hashcons::Id], before: &dyn Fn()) -> R<()> {
+    let nv = cx.nv as usize;
+    let stat = &u.stat;
+    let ev = cx.ev;
+    if cx.out.is_none() {
+        let mut rows = vec![];
+        let hit = cached_rows(&table.borrow(), cx, u.id, bids, u.n, &mut rows, None);
+        if hit.is_some() {
+            stat.hits.set(stat.hits.get() + 1);
+            return emit_values(cx, k, ev, &rows, nv);
         }
-        return match rows {
-            None => Ok(()),
-            Some(rows) => emit_values(cx, k, ev, &rows, nv),
-        };
     }
     // 2. evaluate, noting what is read and how each variable gets its value
-    for &s in clear {
+    before();
+    for &s in &u.clear {
         cx.f.clear(s);
     }
     {
@@ -2443,7 +2746,7 @@ fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id
     }
     let f0 = cx.fallbacks.get();
     cx.rec_on.set(true);
-    let r = inner(cx, &mut || {
+    let r = (u.inner)(cx, &mut || {
         cx.nxt.with(|nx| {
             let mut rec = cx.rec.borrow_mut();
             let mut ws = Vec::with_capacity(nv);
@@ -2465,9 +2768,8 @@ fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id
     });
     cx.rec_on.set(false);
     let mut t = table.borrow_mut();
-    t.n.lookups += 1;
     let rec = cx.rec.borrow();
-    let stored = r.is_ok() && !rec.bad && cx.fallbacks.get() == f0 && sc_::store(&mut t, cx.cur_ids, sc_::Recorded { unit: id, bound: bids, reads: &rec.reads, succs: &rec.succs });
+    let stored = r.is_ok() && !rec.bad && cx.fallbacks.get() == f0 && sc_::store(&mut t, cx.cur_ids, sc_::Recorded { unit: u.id, bound: bids, reads: &rec.reads, succs: &rec.succs });
     if !stored {
         t.n.uncacheable += 1;
     } else {
@@ -2502,29 +2804,107 @@ impl SmallIds {
     }
 }
 
-/// The successors an entry gives for this state, appended to `rows` as rows of `nv` ids; how many.
-/// None: no entry matches, or a change cannot be applied (`rows` may then hold part of a row).
-fn cached_rows(t: &Table, cx: &Cx, unit: u32, bids: &[crate::hashcons::Id], n: N, rows: &mut Vec<crate::hashcons::Id>) -> Option<usize> {
+/// The successors an entry gives for this state; how many. Without `meta` they are appended to `ids` as
+/// rows of `nv` ids. With it each is noted there; with `cx.fpx` too, a successor whose fingerprint can
+/// be told from the changes is noted as a recipe, to be built only if it is a new state (most are
+/// not), and the rest as rows with their fingerprints. None: no entry matches, or a change cannot be
+/// applied (part of a row may then have been added).
+fn cached_rows(t: &Table, cx: &Cx, unit: u32, bids: &[crate::hashcons::Id], n: N, ids: &mut Vec<crate::hashcons::Id>, mut meta: Option<&mut sc_::RowMeta>) -> Option<usize> {
     let cur = cx.cur_ids;
     let tm = t.template(sc_::template_hash(unit, bids), unit, bids)?;
     let mut key = SmallIds::new();
+    let mut h = sc_::leaf_hash_start(tm.version);
     for &loc in tm.locs.iter() {
-        key.push(t.locate(cur, loc)?);
+        let x = t.locate(cur, loc)?;
+        key.push(x);
+        h = sc_::mix(h, x as u64);
     }
-    let leaf = t.leaf(tm.version, key.as_slice())?;
+    let (slot, leaf) = t.leaf_slot(h, tm.version, key.as_slice())?;
     let nv = cx.nv as usize;
-    for s in leaf.succs.iter() {
-        let base = rows.len();
-        rows.extend_from_slice(&cur[..nv]);
-        for (var, put) in s.iter() {
-            let i = *var as usize;
-            rows[base + i] = match put {
-                sc_::Put::Id(x) => *x,
-                sc_::Put::Delta { id, ops } => t.applied(cur[i], *id, |parent| apply_ops(cx, parent, ops, n))?,
-            };
+    for (si, s) in leaf.succs.iter().enumerate() {
+        if let (Some(m), Some(fx)) = (&mut meta, cx.fpx) {
+            if let Some(fp) = delta_fingerprint(t, fx, cur, s) {
+                if fx.verify {
+                    verify_delta(t, cx, fx, cur, s, n, fp);
+                }
+                // (the search looks it up in the seen set soon: the load starts now)
+                fx.seen.prefetch(fp);
+                m.recipe(fp, sc_::Recipe { slot: slot.clone(), succ: si as u32, n });
+                continue;
+            }
         }
+        let base = ids.len();
+        ids.extend_from_slice(&cur[..nv]);
+        build_puts(t, cx, cur, s, n, &mut ids[base..base + nv])?;
+        let Some(m) = &mut meta else {
+            continue;
+        };
+        let Some(fx) = cx.fpx else {
+            m.added(0);
+            continue;
+        };
+        // the parent's fingerprint with the terms of the changed variables replaced
+        let mut sum = fx.sum;
+        for (var, _) in s.iter() {
+            let i = *var as usize;
+            let x = ids[base + i];
+            if x != cur[i] {
+                sum = sum.wrapping_sub(fx.terms[i]).wrapping_add(crate::checker::var_term(i, fx.ids.word(x)));
+            }
+        }
+        m.added(crate::checker::fp_finish(sum));
     }
     Some(leaf.succs.len())
+}
+/// `row` (a copy of the parent's, `cur`) with the changes `s` made. None when a change cannot be applied.
+#[inline]
+fn build_puts(t: &Table, cx: &Cx, cur: &[crate::hashcons::Id], s: &[(u32, sc_::Put)], n: N, row: &mut [crate::hashcons::Id]) -> Option<()> {
+    for (var, put) in s.iter() {
+        let i = *var as usize;
+        row[i] = match put {
+            sc_::Put::Id { id, .. } => *id,
+            sc_::Put::Delta { id, ops, .. } => t.applied(cur[i], *id, |parent| apply_ops(cx, parent, ops, n))?,
+        };
+    }
+    Some(())
+}
+/// Checks that the successor the changes `s` give has the fingerprint `fp`, and that they apply.
+#[cold]
+fn verify_delta(t: &Table, cx: &Cx, fx: &FpCtx, cur: &[crate::hashcons::Id], s: &[(u32, sc_::Put)], n: N, fp: u64) {
+    let nv = cx.nv as usize;
+    let mut row = cur[..nv].to_vec();
+    build_puts(t, cx, cur, s, n, &mut row).expect("changes whose fingerprint is known apply");
+    let mut sum = fx.sum;
+    for k in 0..nv {
+        if row[k] != cur[k] {
+            sum = sum.wrapping_sub(fx.terms[k]).wrapping_add(crate::checker::var_term(k, crate::value::value_word(&crate::hashcons::value(row[k])).unwrap()));
+        }
+    }
+    assert_eq!(crate::checker::fp_finish(sum), fp, "the fingerprint of a successor from its changes");
+}
+/// EVERYSTATE_VERIFY_DELTAS=1: every fingerprint computed from changes is checked against the one of the
+/// successor built (for testing).
+pub fn verify_deltas() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("EVERYSTATE_VERIFY_DELTAS").is_some())
+}
+/// The fingerprint of the successor of the state with ids `cur` that the changes `s` give, from the
+/// parent's terms, without building it. None when a change has to be applied to tell.
+#[inline]
+fn delta_fingerprint(t: &Table, fx: &FpCtx, cur: &[crate::hashcons::Id], s: &[(u32, sc_::Put)]) -> Option<u64> {
+    let mut sum = fx.sum;
+    for (var, put) in s.iter() {
+        let i = *var as usize;
+        let w = match put {
+            sc_::Put::Id { id, .. } if *id == cur[i] => continue,
+            sc_::Put::Id { word, .. } => *word,
+            sc_::Put::Delta { shift: Some(d), .. } => fx.words[i].wrapping_add(*d),
+            sc_::Put::Delta { iops: Some(ops), id, .. } => t.delta_word(fx.ids, cur[i], *id, ops)?,
+            sc_::Put::Delta { iops: None, .. } => return None,
+        };
+        sum = sum.wrapping_sub(fx.terms[i]).wrapping_add(crate::checker::var_term(i, w));
+    }
+    Some(crate::checker::fp_finish(sum))
 }
 
 /// Hands on the successors of a hit, given as rows of ids, as values in the next state, one successor at
@@ -2594,6 +2974,8 @@ pub struct ActPlan {
     run: AE,
     frame: StateRef,
     use_: Usage,
+    /// the top of the action on ids, when it has one (`Plans::run_skel`)
+    skel: Option<Skel>,
 }
 pub struct PredPlan {
     run: CE,
@@ -2692,6 +3074,10 @@ pub fn compile(model: &crate::model::Model) -> Plans {
         c.top = true;
         let body = c.act(a.e, &root);
         units.append(&mut c.unit_stats);
+        let skel = c.skel.take().filter(|_| model.vars.len() > 0).map(|sk| if clear.is_empty() { sk } else { Skel::Pre { ops: clear.clone(), body: Box::new(sk) } }).filter(|sk| sk.depth() <= PATH_MAX);
+        if std::env::var_os("EVERYSTATE_EVAL_DEBUG").is_some() {
+            eprintln!("action {}: {}", a.name, if skel.is_some() { "runs on ids" } else { "runs on values" });
+        }
         let run: AE = if clear.is_empty() {
             body
         } else {
@@ -2700,7 +3086,7 @@ pub fn compile(model: &crate::model::Model) -> Plans {
                 body(cx, k)
             })
         };
-        actions.push(Some(ActPlan { run, frame: StateData::blank(c.nslots.max(1)), use_: Usage::default() }));
+        actions.push(Some(ActPlan { run, frame: StateData::blank(c.nslots.max(1)), use_: Usage::default(), skel }));
     }
     let with_cache = cache_on;
     cache_on = false; // (invariants are not cached)
@@ -2739,7 +3125,7 @@ impl Plans {
     /// `enumerate`). None: the action is not compiled. Some(Err): the attempt failed and must be redone
     /// by the tree-walker after discarding what it produced.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_action(&self, ev: &Evaluator, ai: usize, cur: &StateData, cur_ids: &[crate::hashcons::Id], nxt: &StateData, nv: usize, out: Option<&RefCell<sc_::Rows>>, k: &mut dyn FnMut() -> R<()>) -> Option<R<()>> {
+    pub fn run_action(&self, ev: &Evaluator, ai: usize, cur: &StateData, cur_ids: &[crate::hashcons::Id], nxt: &StateData, nv: usize, out: Option<&RefCell<sc_::Rows>>, fpx: Option<&FpCtx>, k: &mut dyn FnMut() -> R<()>) -> Option<R<()>> {
         let p = match &self.actions[ai] {
             Some(p) if !p.use_.off.get() => p,
             _ => {
@@ -2747,9 +3133,52 @@ impl Plans {
                 return None;
             }
         };
-        let cx = Cx { ev, f: &p.frame, cur, nxt, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: self.cache.as_ref(), rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids, out };
+        let cx = Cx { ev, f: &p.frame, cur, nxt, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: self.cache.as_ref(), rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids, out, vals: None, fpx };
         let f0 = self.n.fallbacks.get();
         let r = (p.run)(&cx, k);
+        self.rec_on.set(false);
+        p.use_.note(self.n.fallbacks.get() - f0);
+        if r.is_err() {
+            self.n.redone.set(self.n.redone.get() + 1);
+        } else {
+            self.n.compiled.set(self.n.compiled.get() + 1);
+        }
+        Some(r)
+    }
+    /// The row of a successor noted as a recipe (`cached_rows`): the parent's, `cur`, with its changes
+    /// made; `verify` (EVERYSTATE_VERIFY_DELTAS) checks that it has the fingerprint `fp` it was noted
+    /// with. False when a change cannot be applied after all (the caller then expands the parent again
+    /// without recipes).
+    pub fn build_recipe(&self, ev: &Evaluator, r: &sc_::Recipe, cur: &[crate::hashcons::Id], nv: usize, row: &mut Vec<crate::hashcons::Id>) -> bool {
+        let Some(t) = &self.cache else { return false };
+        let t = t.borrow();
+        let cx = Cx { ev, f: &self.blank, cur: &self.blank, nxt: &self.blank, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: None, rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids: cur, out: None, vals: None, fpx: None };
+        row.clear();
+        row.extend_from_slice(&cur[..nv]);
+        build_puts(&t, &cx, cur, r.puts(), r.n, row).is_some()
+    }
+    /// Whether action `ai` can run on ids (`run_skel`).
+    pub fn has_skel(&self, ai: usize) -> bool {
+        self.cache.is_some() && matches!(&self.actions[ai], Some(p) if p.skel.is_some() && !p.use_.off.get())
+    }
+    /// Runs action `ai` on the ids of the current state (its skeleton, RFD0002): successors go to `out`.
+    /// `cur` gets the state's values only when `vals` is called, which happens when something has to be
+    /// evaluated on values. None: the action has no skeleton. Some(Err): as for `run_action`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_skel(&self, ev: &Evaluator, ai: usize, cur: &StateData, cur_ids: &[crate::hashcons::Id], nxt: &StateData, nv: usize, out: &RefCell<sc_::Rows>, fpx: Option<&FpCtx>, vals: &dyn Fn(), k: &mut dyn FnMut() -> R<()>) -> Option<R<()>> {
+        let p = match &self.actions[ai] {
+            Some(p) if !p.use_.off.get() => p,
+            _ => return None,
+        };
+        let sk = p.skel.as_ref()?;
+        if self.cache.is_none() || cur_ids.len() < nv {
+            return None;
+        }
+        let cx = Cx { ev, f: &p.frame, cur, nxt, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: self.cache.as_ref(), rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids, out: Some(out), vals: Some(vals), fpx };
+        let f0 = self.n.fallbacks.get();
+        let mut path = Path::new();
+        let mut bids = SmallIds::new();
+        let r = skel_run(sk, &cx, &mut path, &mut bids, k);
         self.rec_on.set(false);
         p.use_.note(self.n.fallbacks.get() - f0);
         if r.is_err() {
@@ -2768,7 +3197,7 @@ impl Plans {
                 return None;
             }
         };
-        let cx = Cx { ev, f: &p.frame, cur: s, nxt: &self.blank, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: None, rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids: &[], out: None };
+        let cx = Cx { ev, f: &p.frame, cur: s, nxt: &self.blank, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: None, rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids: &[], out: None, vals: None, fpx: None };
         let f0 = self.n.fallbacks.get();
         let r = (p.run)(&cx);
         p.use_.note(self.n.fallbacks.get() - f0);
@@ -2792,6 +3221,49 @@ impl Plans {
     pub fn caching_now(&self) -> bool {
         self.cache.is_some() && self.units.iter().any(|u| !u.off.get())
     }
+    /// What the measurements of the units concluded so far, for `adopt` by the plans of another thread.
+    pub fn verdicts(&self) -> Vec<Verdict> {
+        self.units
+            .iter()
+            .map(|u| Verdict {
+                loc: u.loc,
+                kind: match u.phase.get() {
+                    PH_ON => VerdictKind::Pays,
+                    PH_OFF => VerdictKind::DoesNotPay { penalty: u.penalty.get(), skip: u.skip.get() },
+                    _ => VerdictKind::Unknown,
+                },
+            })
+            .collect()
+    }
+    /// Takes the verdicts of the plans of the same model on another thread (`verdicts`) for the units
+    /// that are still warming up here: a worker of the parallel search need not measure again what the
+    /// sequential search measured before it. (They decide how fast, not what: an entry gives the
+    /// successors the evaluation would.)
+    pub fn adopt(&self, vs: &[Verdict]) {
+        if vs.len() != self.units.len() {
+            return;
+        }
+        for (u, v) in self.units.iter().zip(vs) {
+            if u.phase.get() != PH_WARM || v.loc != u.loc {
+                continue;
+            }
+            match v.kind {
+                VerdictKind::Pays => {
+                    u.mark.set(u.hits.get());
+                    u.mark_l.set(u.lookups.get());
+                    u.off.set(false);
+                    u.enter(PH_ON);
+                }
+                VerdictKind::DoesNotPay { penalty, skip } => {
+                    u.penalty.set(penalty);
+                    u.skip.set(skip);
+                    u.off.set(true);
+                    u.enter(PH_OFF);
+                }
+                VerdictKind::Unknown => {}
+            }
+        }
+    }
     /// To be called before each state is expanded (the step cache measures the time between such calls).
     #[inline]
     pub fn tick(&self) {
@@ -2803,7 +3275,7 @@ impl Plans {
         if let Some(t) = &self.cache {
             let t = t.borrow();
             let off = self.units.iter().filter(|u| u.off.get()).count();
-            let m = t.memo.get();
+            let m: [u64; 4] = std::array::from_fn(|i| t.memo[i].get());
             cache = format!(
                 "step cache: budget {:.1} MB, in use {:.1} MB (peak {:.1} MB); {} units, {} measured as not paying; {} lookups, {} hits ({:.2}%), {} stored, {} replaced, {} not stored for size, {} evaluations not cacheable; changes applied {} times, {} computed; locations looked up {} times, {} computed\n",
                 t.budget as f64 / 1048576.0,
@@ -2811,9 +3283,9 @@ impl Plans {
                 t.peak as f64 / 1048576.0,
                 self.units.len(),
                 off,
-                t.n.lookups,
-                t.n.hits,
-                100.0 * t.n.hits as f64 / t.n.lookups.max(1) as f64,
+                self.units.iter().map(|u| u.lookups.get()).sum::<u64>(),
+                self.units.iter().map(|u| u.hits.get()).sum::<u64>(),
+                100.0 * self.units.iter().map(|u| u.hits.get()).sum::<u64>() as f64 / self.units.iter().map(|u| u.lookups.get()).sum::<u64>().max(1) as f64,
                 t.n.stored,
                 t.n.replaced,
                 t.n.too_big,
