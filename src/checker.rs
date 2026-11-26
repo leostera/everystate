@@ -232,7 +232,7 @@ struct StateSink<'a> {
 }
 impl Sink for StateSink<'_> {
     fn emit(&mut self, vals: &[Value], action: u32) {
-        self.out.push(StateData::new(vals.to_vec()));
+        self.out.push(StateData::new(vals.iter().map(|v| crate::hashcons::canon_or_keep(v.clone())).collect()));
         self.act.push(action);
     }
     fn mark(&self) -> usize {
@@ -250,7 +250,7 @@ struct RowSink<'a> {
 }
 impl Sink for RowSink<'_> {
     fn emit(&mut self, vals: &[Value], action: u32) {
-        self.out.extend_from_slice(vals);
+        self.out.extend(vals.iter().map(|v| crate::hashcons::canon_or_keep(v.clone())));
         self.act.push(action);
     }
     fn mark(&self) -> usize {
@@ -364,6 +364,7 @@ impl<'a> Checker<'a> {
     pub fn new(model: &'a Model, opts: CheckOptions) -> Checker<'a> {
         let ev = model.ev;
         let opts_record = opts.record_graph;
+        crate::hashcons::reset();
         ev.steps.enabled.set(std::env::var_os("EVERYSTATE_CACHE_STATS").is_some_and(|v| !v.is_empty() && v != "0"));
         ev.stats.active.set(true);
         ev.stats.check_deadlock.set(opts.check_deadlock);
@@ -865,6 +866,7 @@ impl<'a> Checker<'a> {
             found.into_iter().skip(done)
         };
         for s in found {
+            let s = StateData::new(s.snapshot(self.nvars).into_iter().map(crate::hashcons::canon_or_keep).collect());
             self.generated += 1;
             self.init_generated += 1;
             let mut unseen = true;

@@ -2316,6 +2316,7 @@ impl Evaluator {
                     Some(v) => {
                         v.e[k] = nv;
                         v.h.set(0);
+                        v.canon.set(0);
                         Ok(Value::Tuple(t))
                     }
                     None => {
@@ -2339,6 +2340,7 @@ impl Evaluator {
                     Some(v) => {
                         v.vals[k] = nv;
                         v.h.set(0);
+                        v.canon.set(0);
                         Ok(Value::Record(r))
                     }
                     None => {
@@ -2358,6 +2360,7 @@ impl Evaluator {
                     Some(v) => {
                         v.vals[k] = nv;
                         v.h.set(0);
+                        v.canon.set(0);
                         Ok(Value::Fcn(fc))
                     }
                     None => {

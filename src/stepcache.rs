@@ -152,6 +152,7 @@ impl Table {
         }
     }
     pub fn put(&mut self, h: u64, e: Entry) {
+        let e = canon_entry(e);
         let size = entry_size(&e);
         let i = (h as usize) & self.mask;
         let old = self.slots[i].as_ref().map_or(0, |b| b.1);
@@ -224,16 +225,44 @@ pub fn word_at(vals: &[Value], loc: &Loc) -> Option<u64> {
 }
 #[inline]
 pub fn same(a: &Value, b: &Value) -> bool {
-    use std::rc::Rc;
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Tuple(x), Value::Tuple(y)) if Rc::ptr_eq(x, y) => true,
-        (Value::Record(x), Value::Record(y)) if Rc::ptr_eq(x, y) => true,
-        (Value::Fcn(x), Value::Fcn(y)) if Rc::ptr_eq(x, y) => true,
-        (Value::Set(x), Value::Set(y)) if Rc::ptr_eq(x, y) => true,
-        _ => matches!(val_eq(a, b), Ok(true)),
+    match crate::hashcons::ident(a, b) {
+        Some(eq) => eq,
+        None => matches!(val_eq(a, b), Ok(true)),
+    }
+}
+/// The entry with every value it holds replaced by the canonical equal value (`hashcons`), so that a
+/// later lookup compares them to the state's (canonical) values by identity.
+pub fn canon_entry(e: Entry) -> Entry {
+    use crate::hashcons::canon_or_keep as c;
+    let loc = |l: Loc| match l {
+        Loc::Whole(i) => Loc::Whole(i),
+        Loc::Elem(i, k) => Loc::Elem(i, c(k)),
+        Loc::Member(i, k) => Loc::Member(i, c(k)),
+    };
+    let op = |o: DOp| match o {
+        DOp::Bag { e, plus } => DOp::Bag { e: c(e), plus },
+        DOp::Set { e, add } => DOp::Set { e: c(e), add },
+        DOp::Exc { path, v } => DOp::Exc { path: path.into_iter().map(c).collect(), v: c(v) },
+    };
+    match e {
+        Entry::Tmpl(t) => Entry::Tmpl(Tmpl { unit: t.unit, bound: t.bound.into_iter().map(c).collect(), locs: t.locs.into_iter().map(loc).collect() }),
+        Entry::Leaf(l) => Entry::Leaf(Leaf {
+            unit: l.unit,
+            bound: l.bound.into_iter().map(c).collect(),
+            reads: l.reads.into_iter().map(|(l, v)| (loc(l), c(v))).collect(),
+            succs: l
+                .succs
+                .into_iter()
+                .map(|s| {
+                    s.into_iter()
+                        .map(|w| match w {
+                            Write::Val(v) => Write::Val(c(v)),
+                            Write::Delta(ops) => Write::Delta(ops.into_iter().map(op).collect()),
+                        })
+                        .collect()
+                })
+                .collect(),
+        }),
     }
 }
 /// Does the state have, at `loc`, the value an entry recorded?

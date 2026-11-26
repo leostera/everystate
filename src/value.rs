@@ -24,15 +24,17 @@ pub enum Value {
     Thunk(Rc<Lazy>),
 }
 
-/// A sequence / tuple. `h` caches the fingerprint hash of the value (0 = not computed yet).
+/// A sequence / tuple. `h` caches the fingerprint hash of the value (0 = not computed yet); `canon`
+/// marks a value interned by `hashcons` (0 = not interned; see `hashcons::Canon`).
 pub struct TupleV {
     pub e: Vec<Value>,
     pub h: Cell<u64>,
+    pub canon: Cell<u64>,
 }
 impl TupleV {
     #[inline]
     pub fn rc(e: Vec<Value>) -> Rc<TupleV> {
-        Rc::new(TupleV { e, h: Cell::new(0) })
+        Rc::new(TupleV { e, h: Cell::new(0), canon: Cell::new(0) })
     }
 }
 impl std::ops::Deref for TupleV {
@@ -47,11 +49,12 @@ pub struct RecordV {
     pub names: Rc<Vec<StrId>>, // sorted by string id
     pub vals: Vec<Value>,
     pub h: Cell<u64>,
+    pub canon: Cell<u64>,
 }
 impl RecordV {
     #[inline]
     pub fn new(names: Rc<Vec<StrId>>, vals: Vec<Value>) -> RecordV {
-        RecordV { names, vals, h: Cell::new(0) }
+        RecordV { names, vals, h: Cell::new(0), canon: Cell::new(0) }
     }
     #[inline]
     pub fn get(&self, name: StrId) -> Option<&Value> {
@@ -62,11 +65,12 @@ pub struct FcnV {
     pub dom: Rc<Vec<Value>>, // sorted, deduplicated
     pub vals: Vec<Value>,
     pub h: Cell<u64>,
+    pub canon: Cell<u64>,
 }
 impl FcnV {
     #[inline]
     pub fn new(dom: Rc<Vec<Value>>, vals: Vec<Value>) -> FcnV {
-        FcnV { dom, vals, h: Cell::new(0) }
+        FcnV { dom, vals, h: Cell::new(0), canon: Cell::new(0) }
     }
 }
 
@@ -110,6 +114,7 @@ pub struct SetV {
     cache: OnceCell<Vec<Value>>,
     shape: OnceCell<FcnShape>,
     h: Cell<u64>,
+    pub canon: Cell<u64>,
 }
 
 thread_local! {
@@ -125,7 +130,7 @@ pub fn empty_set() -> Rc<SetV> {
 
 impl SetV {
     pub fn new(k: SetK) -> SetV {
-        SetV { k, cache: OnceCell::new(), shape: OnceCell::new(), h: Cell::new(0) }
+        SetV { k, cache: OnceCell::new(), shape: OnceCell::new(), h: Cell::new(0), canon: Cell::new(0) }
     }
     pub fn of(elems: Vec<Value>) -> Value {
         Value::Set(Rc::new(SetV::new(SetK::Enum(elems))))

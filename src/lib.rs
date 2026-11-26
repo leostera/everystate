@@ -9,6 +9,7 @@ pub mod community;
 pub mod compile;
 pub mod conform;
 pub mod eval;
+pub mod hashcons;
 pub mod host;
 pub mod intern;
 pub mod lexer;
