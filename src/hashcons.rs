@@ -30,6 +30,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static NEXT_EPOCH: AtomicU32 = AtomicU32::new(1);
 
+/// The number of a canonical value in this thread's table (scalars have one too). Ids are dense, start at
+/// 1, and stay below `NOT_INTERNED`.
+pub type Id = u32;
+/// Ids from here on are not ids of the table: users mark values that cannot be interned with them.
+pub const NOT_INTERNED: Id = 1 << 31;
+
 struct Table {
     /// tag bits of this table's nodes: the epoch, shifted into the high half
     epoch: u64,
@@ -45,6 +51,7 @@ struct Table {
 impl Table {
     fn new() -> Table {
         let epoch = (NEXT_EPOCH.fetch_add(1, Ordering::Relaxed) as u64) << 32;
+        EPOCH.with(|e| e.set(epoch));
         Table { epoch, vals: vec![Value::Undef], words: vec![0], slots: vec![0; 1 << 12], mask: (1 << 12) - 1 }
     }
 
@@ -80,6 +87,43 @@ impl Table {
             }
         }
         Some(out)
+    }
+
+    /// The id of the canonical value equal to `v` (interning it, scalars included).
+    fn id(&mut self, v: &Value) -> Option<Id> {
+        let c = match v {
+            Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Model(_) => return Some(self.scalar_id(v)),
+            _ => self.canon(v)?,
+        };
+        Some(tag(&c) as Id)
+    }
+
+    fn scalar_id(&mut self, v: &Value) -> Id {
+        let w = value_word(v).expect("a scalar has a word");
+        let mut i = (spread(w) as usize) & self.mask;
+        loop {
+            let id = self.slots[i] as usize;
+            if id == 0 {
+                break;
+            }
+            if self.words[id] == w && ident_child(&self.vals[id], v) {
+                return id as Id;
+            }
+            i = (i + 1) & self.mask;
+        }
+        self.insert_at(i, v.clone(), w) as Id
+    }
+
+    fn insert_at(&mut self, slot: usize, node: Value, w: u64) -> usize {
+        let id = self.vals.len();
+        assert!(id < NOT_INTERNED as usize, "more than 2^31 distinct values");
+        self.slots[slot] = id as u32;
+        self.vals.push(node);
+        self.words.push(w);
+        if self.vals.len() * 2 > self.slots.len() {
+            self.grow();
+        }
+        id
     }
 
     #[cold]
@@ -130,9 +174,7 @@ impl Table {
             }
             i = (i + 1) & self.mask;
         }
-        let id = self.vals.len();
-        assert!(id < u32::MAX as usize, "more than 2^32 distinct values");
-        let tag = self.epoch | id as u64;
+        let tag = self.epoch | self.vals.len() as u64;
         match &node {
             Value::Tuple(t) => t.canon.set(tag),
             Value::Record(r) => r.canon.set(tag),
@@ -140,12 +182,7 @@ impl Table {
             Value::Set(s) => s.canon.set(tag),
             _ => unreachable!(),
         }
-        self.slots[i] = id as u32;
-        self.vals.push(node.clone());
-        self.words.push(w);
-        if self.vals.len() * 2 > self.slots.len() {
-            self.grow();
-        }
+        self.insert_at(i, node.clone(), w);
         Some(node)
     }
 
@@ -204,6 +241,8 @@ fn same_node(a: &Value, b: &Value) -> bool {
 
 thread_local! {
     static TABLE: RefCell<Table> = RefCell::new(Table::new());
+    /// a copy of the table's epoch, readable without borrowing the table
+    static EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The canonical value equal to `v` (interning it), or None when `v` cannot be interned.
@@ -213,6 +252,57 @@ pub fn canon(v: &Value) -> Option<Value> {
         Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Model(_) => Some(v.clone()),
         _ => TABLE.with(|t| t.borrow_mut().canon(v)),
     }
+}
+
+/// The id of the canonical value equal to `v` (interning it), or None when `v` cannot be interned.
+#[inline]
+pub fn id(v: &Value) -> Option<Id> {
+    match v {
+        Value::Tuple(t) if is_current(t.canon.get()) => Some(t.canon.get() as Id),
+        Value::Record(r) if is_current(r.canon.get()) => Some(r.canon.get() as Id),
+        Value::Fcn(f) if is_current(f.canon.get()) => Some(f.canon.get() as Id),
+        Value::Set(s) if is_current(s.canon.get()) => Some(s.canon.get() as Id),
+        _ => TABLE.with(|t| t.borrow_mut().id(v)),
+    }
+}
+
+/// The id of `v` when it is a canonical composite of this thread's table (no interning, no borrow).
+#[inline]
+pub fn id_if_canonical(v: &Value) -> Option<Id> {
+    let t = tag(v);
+    if is_current(t) {
+        Some(t as Id)
+    } else {
+        None
+    }
+}
+
+/// The value with id `id` (a shared reference to the canonical node).
+#[inline]
+pub fn value(id: Id) -> Value {
+    TABLE.with(|t| t.borrow().vals[id as usize].clone())
+}
+
+/// The fingerprint word (`value_word`) of the value with id `id`.
+#[inline]
+pub fn word(id: Id) -> u64 {
+    TABLE.with(|t| t.borrow().words[id as usize])
+}
+
+/// Runs `f` with read access to the values and words by id (for loops over many ids). `f` must not
+/// intern anything.
+#[inline]
+pub fn with_ids<T>(f: impl FnOnce(&[Value], &[u64]) -> T) -> T {
+    TABLE.with(|t| {
+        let t = t.borrow();
+        f(&t.vals, &t.words)
+    })
+}
+
+/// Whether a tag marks a node of this thread's current table.
+#[inline]
+fn is_current(tag: u64) -> bool {
+    tag != 0 && tag & !0xFFFF_FFFF == EPOCH.with(|e| e.get())
 }
 
 /// `canon(&v)`, or `v` itself when it cannot be interned.
@@ -259,7 +349,7 @@ pub fn reset() {
     TABLE.with(|t| *t.borrow_mut() = Table::new());
 }
 
-/// Number of values interned on this thread since the last `reset`.
+/// Number of values interned on this thread since the last `reset` (scalars included).
 pub fn len() -> usize {
     TABLE.with(|t| t.borrow().vals.len() - 1)
 }
@@ -315,6 +405,21 @@ mod tests {
         let b = canon(&tup(vec![Value::Int(7)])).unwrap();
         // `a` is from the old epoch: not identical to `b`, and not known to differ either
         assert_eq!(ident(&a, &b), None);
-        assert_eq!(len(), 1);
+        assert_eq!(len(), 1); // <<7>> (a scalar gets a slot only when its id is asked for)
+    }
+
+    #[test]
+    fn ids_name_values() {
+        reset();
+        let a = id(&tup(vec![Value::Int(1), Value::Str(str_id("y"))])).unwrap();
+        let b = id(&tup(vec![Value::Int(1), Value::Str(str_id("y"))])).unwrap();
+        assert_eq!(a, b);
+        let one = id(&Value::Int(1)).unwrap();
+        assert_ne!(one, a);
+        assert_eq!(id(&Value::Int(1)), Some(one));
+        // a scalar and a model value with the same number are different values
+        assert_ne!(id(&Value::Str(str_id("y"))), id(&Value::Model(str_id("y"))));
+        assert_eq!(word(a), value_word(&value(a)).unwrap());
+        assert!(id(&Value::Set(Rc::new(SetV::new(SetK::Interval(1, 2))))).is_none());
     }
 }

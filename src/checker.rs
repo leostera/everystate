@@ -212,6 +212,11 @@ fn same_value(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The state with every value replaced by the canonical equal value, where there is one (`hashcons`).
+fn canon_state(s: &StateRef, nv: usize) -> StateRef {
+    StateData::new(s.snapshot(nv).into_iter().map(crate::hashcons::canon_or_keep).collect())
+}
+
 /// The fingerprint terms of the variables of a state whose successors are being fingerprinted.
 #[derive(Default)]
 pub(crate) struct ParentTerms {
@@ -232,7 +237,7 @@ struct StateSink<'a> {
 }
 impl Sink for StateSink<'_> {
     fn emit(&mut self, vals: &[Value], action: u32) {
-        self.out.push(StateData::new(vals.iter().map(|v| crate::hashcons::canon_or_keep(v.clone())).collect()));
+        self.out.push(StateData::new(vals.to_vec()));
         self.act.push(action);
     }
     fn mark(&self) -> usize {
@@ -250,7 +255,7 @@ struct RowSink<'a> {
 }
 impl Sink for RowSink<'_> {
     fn emit(&mut self, vals: &[Value], action: u32) {
-        self.out.extend(vals.iter().map(|v| crate::hashcons::canon_or_keep(v.clone())));
+        self.out.extend_from_slice(vals);
         self.act.push(action);
     }
     fn mark(&self) -> usize {
@@ -259,6 +264,78 @@ impl Sink for RowSink<'_> {
     fn truncate(&mut self, mark: usize) {
         self.out.truncate(mark * self.n);
         self.act.truncate(mark);
+    }
+}
+
+/// Successors as rows of ids (see `stepcache::Rows`); a step-cache hit adds to the same rows directly.
+struct IdSink<'a> {
+    rows: &'a std::cell::RefCell<crate::stepcache::Rows>,
+    n: usize,
+}
+impl Sink for IdSink<'_> {
+    fn emit(&mut self, vals: &[Value], _action: u32) {
+        // (the action is `cur_act`, set by `successors_with`)
+        self.rows.borrow_mut().push_values(vals);
+    }
+    fn mark(&self) -> usize {
+        self.rows.borrow().act.len()
+    }
+    fn truncate(&mut self, mark: usize) {
+        let mut r = self.rows.borrow_mut();
+        r.ids.truncate(mark * self.n);
+        r.act.truncate(mark);
+    }
+}
+
+/// The states of a search whose successors are rows of ids: the row of each state, in state order.
+/// A variable whose value cannot be interned is `NOT_INTERNED + i`, `i` an index into `opaque`.
+#[derive(Default)]
+pub(crate) struct IdStore {
+    nv: usize,
+    ids: Vec<crate::hashcons::Id>,
+    opaque: Vec<Value>,
+}
+impl IdStore {
+    fn row(&self, i: usize) -> &[crate::hashcons::Id] {
+        &self.ids[i * self.nv..(i + 1) * self.nv]
+    }
+    /// Appends a successor row of `rows`, interning the values it holds as values (those that cannot be
+    /// interned stay values, in `opaque`).
+    fn push_row(&mut self, row: &[crate::hashcons::Id], rows: &crate::stepcache::Rows) {
+        use crate::hashcons::NOT_INTERNED;
+        for &x in row {
+            if x >= NOT_INTERNED {
+                let v = rows.value(x);
+                match crate::hashcons::id(&v) {
+                    Some(y) => self.ids.push(y),
+                    None => {
+                        self.opaque.push(v);
+                        self.ids.push(NOT_INTERNED + (self.opaque.len() - 1) as u32);
+                    }
+                }
+            } else {
+                self.ids.push(x);
+            }
+        }
+    }
+    fn push_values(&mut self, vals: &[Value]) {
+        use crate::hashcons::NOT_INTERNED;
+        for v in &vals[..self.nv] {
+            match crate::hashcons::id(v) {
+                Some(x) => self.ids.push(x),
+                None => {
+                    self.opaque.push(v.clone());
+                    self.ids.push(NOT_INTERNED + (self.opaque.len() - 1) as u32);
+                }
+            }
+        }
+    }
+    fn values(&self, row: &[crate::hashcons::Id]) -> Vec<Value> {
+        use crate::hashcons::NOT_INTERNED;
+        crate::hashcons::with_ids(|vals, _| row.iter().map(|&x| if x >= NOT_INTERNED { self.opaque[(x - NOT_INTERNED) as usize].clone() } else { vals[x as usize].clone() }).collect())
+    }
+    fn state(&self, i: usize) -> StateRef {
+        StateData::new(self.values(self.row(i)))
     }
 }
 
@@ -350,6 +427,11 @@ pub struct Checker<'a> {
     flat: bool,
     /// EVERYSTATE_EVAL=compiled: the compiled actions and invariants (see compile.rs)
     plans: Option<crate::compile::Plans>,
+    /// Flat and one worker: states are kept as rows of value ids (`IdStore`), successors are found as
+    /// rows of ids, and a state is rebuilt as values only to be expanded or checked. `states` then holds
+    /// the placeholder `empty` for every state.
+    idmode: bool,
+    pub(crate) store: IdStore,
 }
 
 pub const NO_PARENT: u32 = u32::MAX;
@@ -445,6 +527,8 @@ impl<'a> Checker<'a> {
                 && model.implied_actions.is_empty()
                 && model.view.is_none()
                 && model.symmetry.is_none(),
+            idmode: false,
+            store: IdStore { nv: model.vars.len(), ..Default::default() },
             level_end: usize::MAX,
             last_progress: 0.0,
             t_start: 0.0,
@@ -455,6 +539,9 @@ impl<'a> Checker<'a> {
 
     /// State `i`. The states found by the parallel search are kept serialized and rebuilt on demand.
     pub fn state_at(&self, i: usize) -> StateRef {
+        if self.idmode {
+            return self.store.state(i);
+        }
         let s = &self.states[i];
         #[cfg(not(target_arch = "wasm32"))]
         if Rc::ptr_eq(s, &self.empty) {
@@ -608,6 +695,46 @@ impl<'a> Checker<'a> {
             }
             Ok(fp_finish(sum))
         })
+    }
+
+    /// The fingerprints of the successor rows of `s` (whose ids are `cur`), as `row_fingerprint` computes
+    /// them from values: a changed variable is one whose id differs. None where a value has no word (the
+    /// error is reported when the successor is fingerprinted from its values).
+    fn id_fingerprints(&self, s: &StateRef, cur: &[crate::hashcons::Id], pt: &ParentTerms, rows: &crate::stepcache::Rows, out: &mut Vec<Option<u64>>) {
+        use crate::hashcons::NOT_INTERNED;
+        let nv = self.nvars;
+        out.clear();
+        crate::hashcons::with_ids(|_, words| {
+            s.with(|pv| {
+                for row in rows.ids.chunks_exact(nv) {
+                    let mut sum = pt.sum;
+                    let mut ok = true;
+                    for k in 0..nv {
+                        let x = row[k];
+                        if x == cur[k] && x < NOT_INTERNED {
+                            continue;
+                        }
+                        let w = if x < NOT_INTERNED {
+                            words[x as usize]
+                        } else {
+                            let v = &rows.opaque[(x - NOT_INTERNED) as usize];
+                            if same_value(v, &pv[k]) {
+                                continue;
+                            }
+                            match value_word(v) {
+                                Ok(w) => w,
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        };
+                        sum = sum.wrapping_sub(pt.term[k]).wrapping_add(var_term(k, w));
+                    }
+                    out.push(if ok { Some(fp_finish(sum)) } else { None });
+                }
+            })
+        });
     }
 
     pub fn result(&self, status: &'static str) -> CheckResult {
@@ -866,7 +993,7 @@ impl<'a> Checker<'a> {
             found.into_iter().skip(done)
         };
         for s in found {
-            let s = StateData::new(s.snapshot(self.nvars).into_iter().map(crate::hashcons::canon_or_keep).collect());
+            let s = canon_state(&s, self.nvars);
             self.generated += 1;
             self.init_generated += 1;
             let mut unseen = true;
@@ -885,7 +1012,12 @@ impl<'a> Checker<'a> {
                     id = nid as i64;
                     unseen = self.fps.put(fp, nid as u32).is_none();
                     if unseen {
-                        self.states.push(s.clone());
+                        if self.idmode {
+                            s.with(|v| self.store.push_values(v));
+                            self.states.push(self.empty.clone());
+                        } else {
+                            self.states.push(s.clone());
+                        }
                         self.parent.push(NO_PARENT);
                         self.level.push(1);
                         self.act.push(-1);
@@ -948,14 +1080,33 @@ impl<'a> Checker<'a> {
 
     // Successors of one state, as (state, action index) pairs in action order.
     pub fn successors(&self, s: &StateRef, out: &mut Vec<StateRef>, out_act: &mut Vec<u32>) -> R<()> {
-        self.successors_with(s, &mut StateSink { out, act: out_act })
+        self.successors_with(s, None, None, &mut StateSink { out, act: out_act })
     }
     /// As `successors`, without allocating a state per successor: the variables of each successor are
     /// appended to `out` (`nvars` values per successor).
     pub(crate) fn successors_flat(&self, s: &StateRef, out: &mut Vec<Value>, out_act: &mut Vec<u32>) -> R<()> {
-        self.successors_with(s, &mut RowSink { out, act: out_act, n: self.nvars })
+        self.successors_with(s, None, None, &mut RowSink { out, act: out_act, n: self.nvars })
     }
-    fn successors_with(&self, s: &StateRef, sink: &mut dyn Sink) -> R<()> {
+    /// As `successors`, as rows of ids in `rows` (cleared first). `cur` are the ids of `s` as the store
+    /// has them; a value that is not interned is renumbered into `rows` (so that a row copied from `cur`
+    /// means what it says).
+    pub(crate) fn successors_ids(&self, s: &StateRef, cur: &mut [crate::hashcons::Id], rows: &std::cell::RefCell<crate::stepcache::Rows>) -> R<()> {
+        use crate::hashcons::NOT_INTERNED;
+        {
+            let mut r = rows.borrow_mut();
+            r.clear();
+            for (k, x) in cur.iter_mut().enumerate() {
+                if *x >= NOT_INTERNED {
+                    r.opaque.push(s.get(k));
+                    *x = NOT_INTERNED + (r.opaque.len() - 1) as u32;
+                }
+            }
+        }
+        self.successors_with(s, Some(cur), Some(rows), &mut IdSink { rows, n: self.nvars })
+    }
+    /// `cur`: the ids of the variables of `s` when known; `rows`: where the sink collects rows of ids, if
+    /// it does (a step-cache hit then adds to it directly).
+    fn successors_with(&self, s: &StateRef, cur: Option<&[crate::hashcons::Id]>, rows: Option<&std::cell::RefCell<crate::stepcache::Rows>>, sink: &mut dyn Sink) -> R<()> {
         if let Some(plans) = &self.plans {
             plans.tick();
         }
@@ -964,7 +1115,19 @@ impl<'a> Checker<'a> {
         let n = self.nvars;
         let actions = &m.actions;
         let mut nxt = StateData::blank(n);
+        let mut own_ids = vec![];
+        let cur: &[crate::hashcons::Id] = match cur {
+            Some(c) => c,
+            None if self.plans.as_ref().is_some_and(|p| p.caching()) => {
+                s.with(|v| crate::stepcache::ids_of(&v[..n], &mut own_ids));
+                &own_ids
+            }
+            None => &[],
+        };
         for (ai, a) in actions.iter().enumerate() {
+            if let Some(r) = rows {
+                r.borrow_mut().cur_act = ai as u32;
+            }
             // The buffer is all-unassigned again after an enumeration; reuse it unless a lazy value kept a
             // reference to it (ours plus the evaluator's make two).
             if Rc::strong_count(&nxt) > 2 {
@@ -977,7 +1140,7 @@ impl<'a> Checker<'a> {
             ev.n_assigned.set(0);
             if let (Some(plans), false) = (&self.plans, ev.steps.enabled.get()) {
                 let mark = sink.mark();
-                let attempt = plans.run_action(ev, ai, s, &nxt, n, &mut || {
+                let attempt = plans.run_action(ev, ai, s, cur, &nxt, n, rows, &mut || {
                     if !nxt.all_defined(n) {
                         // (the tree-walker, run again below, words the error)
                         return Err(Box::new(Fail::Check { status: "incomplete", message: String::new() }));
@@ -1067,6 +1230,11 @@ impl<'a> Checker<'a> {
         }
         #[cfg(not(target_arch = "wasm32"))]
         crate::par::prepare(self);
+        #[cfg(not(target_arch = "wasm32"))]
+        let parallel = self.par.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let parallel = false;
+        self.idmode = self.flat && !parallel;
         if let Some(r) = self.compute_init(events) {
             return r;
         }
@@ -1079,6 +1247,11 @@ impl<'a> Checker<'a> {
         // the current state's variables
         let mut rows: Vec<Value> = vec![];
         let mut pterms = ParentTerms::default();
+        // id mode: the ids of the state being expanded, its successors as rows of ids, their fingerprints
+        let idmode = self.idmode;
+        let mut cur_ids: Vec<crate::hashcons::Id> = vec![];
+        let idrows = std::cell::RefCell::new(crate::stepcache::Rows::default());
+        let mut row_fps: Vec<Option<u64>> = vec![];
         let record = self.opts.record_graph;
         let ev = self.ev;
         self.last_progress = ev.host.borrow().now_ms();
@@ -1102,14 +1275,28 @@ impl<'a> Checker<'a> {
                 }
             }
             self.head += 1;
-            let s = self.states[sid].clone();
+            let s = if idmode {
+                cur_ids.clear();
+                cur_ids.extend_from_slice(self.store.row(sid));
+                self.store.state(sid)
+            } else {
+                self.states[sid].clone()
+            };
             let lvl = self.level[sid];
             self.cur_level = lvl;
             self.sync_stats();
             succs.clear();
             succ_act.clear();
             rows.clear();
-            let generated = if flat { self.successors_flat(&s, &mut rows, &mut succ_act) } else { self.successors(&s, &mut succs, &mut succ_act) };
+            let generated = if idmode {
+                let r = self.successors_ids(&s, &mut cur_ids, &idrows);
+                succ_act.extend_from_slice(&idrows.borrow().act);
+                r
+            } else if flat {
+                self.successors_flat(&s, &mut rows, &mut succ_act)
+            } else {
+                self.successors(&s, &mut succs, &mut succ_act)
+            };
             if let Err(e) = generated {
                 return match *e {
                     Fail::Check { status, message } => {
@@ -1129,13 +1316,43 @@ impl<'a> Checker<'a> {
                 if let Err(e) = self.parent_terms(&s, &mut pterms) {
                     return self.error(self.describe_err(&e, true), Some(self.trace_to(sid)));
                 }
+                if idmode {
+                    self.id_fingerprints(&s, &cur_ids, &pterms, &idrows.borrow(), &mut row_fps);
+                }
             }
             for i in 0..succ_act.len() {
                 let ai = succ_act[i] as usize;
                 self.generated += 1;
                 ev.stats.generated.set(self.generated as i64);
                 let mut known_fp: Option<u64> = None;
-                let t = if flat {
+                let t = if idmode {
+                    match row_fps[i] {
+                        Some(fp) if self.fps.contains(fp) => continue,
+                        Some(fp) if m.invariants.is_empty() => {
+                            // a new state that nothing looks at: no values are built for it
+                            let nid = self.states.len();
+                            self.fps.put(fp, nid as u32);
+                            let r = idrows.borrow();
+                            self.store.push_row(&r.ids[i * nv..(i + 1) * nv], &r);
+                            self.states.push(self.empty.clone());
+                            self.parent.push(sid as u32);
+                            self.level.push(lvl + 1);
+                            self.act.push(ai as i32);
+                            if lvl + 1 > self.depth {
+                                self.depth = lvl + 1;
+                                ev.stats.diameter.set(self.depth as i64);
+                            }
+                            fresh += 1;
+                            ev.stats.distinct.set(self.states.len() as i64);
+                            ev.stats.queue.set(self.states.len() as i64 - self.head as i64);
+                            continue;
+                        }
+                        Some(fp) => known_fp = Some(fp),
+                        None => {}
+                    }
+                    let r = idrows.borrow();
+                    StateData::new(r.ids[i * nv..(i + 1) * nv].iter().map(|&x| r.value(x)).collect())
+                } else if flat {
                     let row = &rows[i * nv..(i + 1) * nv];
                     match self.row_fingerprint(&s, &pterms, row) {
                         // seen before: nothing else looks at this successor, so no state is built for it
@@ -1177,7 +1394,15 @@ impl<'a> Checker<'a> {
                         match self.fps.put(fp, nid as u32) {
                             None => {
                                 id = nid as i64;
-                                self.states.push(t.clone());
+                                if idmode {
+                                    let r = idrows.borrow();
+                                    self.store.push_row(&r.ids[i * nv..(i + 1) * nv], &r);
+                                    self.states.push(self.empty.clone());
+                                } else {
+                                    // a new state keeps canonical values (`hashcons`): shared with every
+                                    // other state that has them, and compared by identity in the step cache
+                                    self.states.push(canon_state(&t, nv));
+                                }
                                 self.parent.push(sid as u32);
                                 self.level.push(lvl + 1);
                                 self.act.push(ai as i32);

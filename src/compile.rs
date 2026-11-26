@@ -22,7 +22,7 @@ use crate::ast::*;
 use crate::eval::*;
 use crate::intern::*;
 use crate::modules::{for_children, level_of, tail_fn, BFn, Builtin, Def};
-use crate::stepcache::{self as sc_, DOp, Entry, Leaf, Loc, Table, Tmpl, Write};
+use crate::stepcache::{self as sc_, DOp, Loc, Table, Write};
 use crate::value::*;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashSet;
@@ -43,6 +43,12 @@ pub struct Cx<'a> {
     pub rec: &'a RefCell<Rec>,
     pub cache_always: bool,
     pub meas: &'a Meas,
+    /// the ids of the current state's variables (`hashcons`; `NOT_INTERNED` for a value that is not
+    /// interned), for the step cache; empty when not known
+    pub cur_ids: &'a [crate::hashcons::Id],
+    /// where successors go as rows of ids, when the caller collects them so (a step-cache hit then adds
+    /// its rows directly instead of handing each successor to the continuation)
+    pub out: Option<&'a RefCell<sc_::Rows>>,
 }
 /// What the evaluation of a unit read and did, noted for the step cache.
 #[derive(Default)]
@@ -2155,10 +2161,6 @@ impl Comp {
     }
 }
 
-const LEAF: u64 = 0x1EAF_1EAF_1EAF_1EAF;
-fn bound_eq(vals: &[Value], cx: &Cx, bound: &[usize]) -> bool {
-    vals.len() == bound.len() && vals.iter().zip(bound).all(|(v, &s)| sc_::same(v, &cx.f.get(s)))
-}
 /// A unit with the step cache on: the stored successors when an entry matches the state, else an
 /// evaluation that is recorded and stored.
 #[allow(clippy::too_many_arguments)]
@@ -2378,46 +2380,43 @@ impl UnitStat {
 #[allow(clippy::too_many_arguments)]
 fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id: u32, bound: &[usize], clear: &[usize], inner: &AE, stat: &UnitStat, n: N) -> R<()> {
     let nv = cx.nv as usize;
-    let mut h0 = sc_::mix(0x5EED, id as u64);
-    for &s in bound {
-        match value_word(&cx.f.get(s)) {
-            Ok(w) => h0 = sc_::mix(h0, w),
-            Err(_) => return inner(cx, k),
-        }
+    if cx.cur_ids.len() < nv {
+        return inner(cx, k);
     }
+    let mut bids: SmallIds = SmallIds::new();
+    let all = cx.f.with(|fv| bound.iter().all(|&s| matches!(fv.get(s).and_then(crate::hashcons::id), Some(x) if bids.push(x))));
+    if !all {
+        return inner(cx, k);
+    }
+    let bids = bids.as_slice();
     stat.lookups.set(stat.lookups.get() + 1);
-    // 1. an entry whose unit, bound values and reads all match this state
-    let hit: Option<Vec<Value>> = cx.cur.with(|cv| {
+    // 1. an entry whose unit, bound values and located values all match this state
+    let ev = cx.ev;
+    let hit = {
         let t = table.borrow();
-        let tm = match t.get(h0) {
-            Some(Entry::Tmpl(tm)) if tm.unit == id && bound_eq(&tm.bound, cx, bound) => tm,
-            _ => return None,
-        };
-        let mut h1 = h0;
-        for loc in &tm.locs {
-            h1 = sc_::mix(h1, sc_::word_at(cv, loc)?);
-        }
-        let leaf = match t.get(sc_::mix(h1, LEAF)) {
-            Some(Entry::Leaf(l)) if l.unit == id && bound_eq(&l.bound, cx, bound) => l,
-            _ => return None,
-        };
-        if !leaf.reads.iter().all(|(loc, v)| sc_::holds(cv, loc, v)) {
-            return None;
-        }
-        // every successor is built before any is handed on: if a change cannot be applied, this is a miss
-        let mut rows = Vec::with_capacity(leaf.succs.len() * nv);
-        for s in &leaf.succs {
-            for (i, w) in s.iter().enumerate() {
-                rows.push(match w {
-                    Write::Val(v) => v.clone(),
-                    Write::Delta(ops) if ops.is_empty() => cv[i].clone(),
-                    Write::Delta(ops) => apply_ops(cx, &cv[i], ops, n)?,
-                });
+        match cx.out {
+            // successors collected as ids: the rows go straight there
+            Some(out) => {
+                let mut o = out.borrow_mut();
+                let mark = o.ids.len();
+                match cached_rows(&t, cx, id, bids, n, &mut o.ids) {
+                    Some(count) => {
+                        let a = o.cur_act;
+                        o.act.extend(std::iter::repeat_n(a, count));
+                        Some(None)
+                    }
+                    None => {
+                        o.ids.truncate(mark);
+                        None
+                    }
+                }
+            }
+            None => {
+                let mut rows = vec![];
+                cached_rows(&t, cx, id, bids, n, &mut rows).map(|_| Some(rows))
             }
         }
-        Some(rows)
-    });
-    let ev = cx.ev;
+    };
     if let Some(rows) = hit {
         stat.hits.set(stat.hits.get() + 1);
         {
@@ -2425,20 +2424,10 @@ fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id
             t.n.lookups += 1;
             t.n.hits += 1;
         }
-        let mut rows = rows.into_iter();
-        while rows.len() > 0 {
-            for i in 0..nv {
-                cx.nxt.set(i, rows.next().unwrap());
-            }
-            ev.n_assigned.set(nv as i64);
-            let r = k();
-            for i in 0..nv {
-                cx.nxt.clear(i);
-            }
-            ev.n_assigned.set(0);
-            r?;
-        }
-        return Ok(());
+        return match rows {
+            None => Ok(()),
+            Some(rows) => emit_values(cx, k, ev, &rows, nv),
+        };
     }
     // 2. evaluate, noting what is read and how each variable gets its value
     for &s in clear {
@@ -2477,50 +2466,85 @@ fn unit_cached(cx: &Cx, k: &mut dyn FnMut() -> R<()>, table: &RefCell<Table>, id
     cx.rec_on.set(false);
     let mut t = table.borrow_mut();
     t.n.lookups += 1;
-    let mut rec = cx.rec.borrow_mut();
-    let mut stored = false;
-    if r.is_ok() && !rec.bad && cx.fallbacks.get() == f0 {
-        stored = cx.cur.with(|cv| {
-            let bvals: Vec<Value> = bound.iter().map(|&s| cx.f.get(s)).collect();
-            // the locations whose values pick the entry: those of earlier evaluations of this unit with
-            // these bound values, and any new ones
-            let mut locs: Vec<Loc> = match t.get(h0) {
-                Some(Entry::Tmpl(tm)) if tm.unit == id && bound_eq(&tm.bound, cx, bound) => tm.locs.clone(),
-                _ => vec![],
-            };
-            let had = locs.len();
-            let fresh = !matches!(t.get(h0), Some(Entry::Tmpl(tm)) if tm.unit == id && bound_eq(&tm.bound, cx, bound));
-            for (loc, _) in &rec.reads {
-                if !locs.iter().any(|l| sc_::same_loc(l, loc)) {
-                    locs.push(loc.clone());
-                }
-            }
-            // A large value read whole makes a poor key: it rarely recurs, and comparing it costs as much
-            // as the evaluation saved. Such an evaluation is not stored (and its unit soon backs off).
-            if locs.len() > 24 || rec.reads.iter().any(|(_, v)| sc_::vsize(v) > 512) {
-                return false;
-            }
-            let mut h1 = h0;
-            for loc in &locs {
-                match sc_::word_at(cv, loc) {
-                    Some(w) => h1 = sc_::mix(h1, w),
-                    None => return false,
-                }
-            }
-            if fresh || locs.len() != had {
-                t.put(h0, Entry::Tmpl(Tmpl { unit: id, bound: bvals.clone(), locs }));
-            }
-            let leaf = Leaf { unit: id, bound: bvals, reads: std::mem::take(&mut rec.reads), succs: std::mem::take(&mut rec.succs) };
-            t.put(sc_::mix(h1, LEAF), Entry::Leaf(leaf));
-            true
-        });
-    }
+    let rec = cx.rec.borrow();
+    let stored = r.is_ok() && !rec.bad && cx.fallbacks.get() == f0 && sc_::store(&mut t, cx.cur_ids, sc_::Recorded { unit: id, bound: bids, reads: &rec.reads, succs: &rec.succs });
     if !stored {
         t.n.uncacheable += 1;
     } else {
         stat.stored.set(stat.stored.get() + 1);
     }
     r
+}
+
+/// Up to 24 ids on the stack (the bound values of a unit, or the located values of a template).
+struct SmallIds {
+    n: usize,
+    a: [crate::hashcons::Id; 24],
+}
+impl SmallIds {
+    #[inline]
+    fn new() -> SmallIds {
+        SmallIds { n: 0, a: [0; 24] }
+    }
+    /// False when full.
+    #[inline]
+    fn push(&mut self, x: crate::hashcons::Id) -> bool {
+        if self.n == self.a.len() {
+            return false;
+        }
+        self.a[self.n] = x;
+        self.n += 1;
+        true
+    }
+    #[inline]
+    fn as_slice(&self) -> &[crate::hashcons::Id] {
+        &self.a[..self.n]
+    }
+}
+
+/// The successors an entry gives for this state, appended to `rows` as rows of `nv` ids; how many.
+/// None: no entry matches, or a change cannot be applied (`rows` may then hold part of a row).
+fn cached_rows(t: &Table, cx: &Cx, unit: u32, bids: &[crate::hashcons::Id], n: N, rows: &mut Vec<crate::hashcons::Id>) -> Option<usize> {
+    let cur = cx.cur_ids;
+    let tm = t.template(sc_::template_hash(unit, bids), unit, bids)?;
+    let mut key = SmallIds::new();
+    for &loc in tm.locs.iter() {
+        key.push(t.locate(cur, loc)?);
+    }
+    let leaf = t.leaf(tm.version, key.as_slice())?;
+    let nv = cx.nv as usize;
+    for s in leaf.succs.iter() {
+        let base = rows.len();
+        rows.extend_from_slice(&cur[..nv]);
+        for (var, put) in s.iter() {
+            let i = *var as usize;
+            rows[base + i] = match put {
+                sc_::Put::Id(x) => *x,
+                sc_::Put::Delta { id, ops } => t.applied(cur[i], *id, |parent| apply_ops(cx, parent, ops, n))?,
+            };
+        }
+    }
+    Some(leaf.succs.len())
+}
+
+/// Hands on the successors of a hit, given as rows of ids, as values in the next state, one successor at
+/// a time.
+fn emit_values(cx: &Cx, k: &mut dyn FnMut() -> R<()>, ev: &Evaluator, rows: &[crate::hashcons::Id], nv: usize) -> R<()> {
+    for row in rows.chunks_exact(nv) {
+        cx.cur.with(|cv| {
+            for i in 0..nv {
+                cx.nxt.set(i, if row[i] == cx.cur_ids[i] { cv[i].clone() } else { crate::hashcons::value(row[i]) });
+            }
+        });
+        ev.n_assigned.set(nv as i64);
+        let r = k();
+        for i in 0..nv {
+            cx.nxt.clear(i);
+        }
+        ev.n_assigned.set(0);
+        r?;
+    }
+    Ok(())
 }
 fn with_clear(clear: Vec<PreOp>, body: CE) -> CE {
     if clear.is_empty() {
@@ -2714,7 +2738,8 @@ impl Plans {
     /// Runs the compiled form of action `ai` (the evaluator's current and next state are set as for
     /// `enumerate`). None: the action is not compiled. Some(Err): the attempt failed and must be redone
     /// by the tree-walker after discarding what it produced.
-    pub fn run_action(&self, ev: &Evaluator, ai: usize, cur: &StateData, nxt: &StateData, nv: usize, k: &mut dyn FnMut() -> R<()>) -> Option<R<()>> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_action(&self, ev: &Evaluator, ai: usize, cur: &StateData, cur_ids: &[crate::hashcons::Id], nxt: &StateData, nv: usize, out: Option<&RefCell<sc_::Rows>>, k: &mut dyn FnMut() -> R<()>) -> Option<R<()>> {
         let p = match &self.actions[ai] {
             Some(p) if !p.use_.off.get() => p,
             _ => {
@@ -2722,7 +2747,7 @@ impl Plans {
                 return None;
             }
         };
-        let cx = Cx { ev, f: &p.frame, cur, nxt, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: self.cache.as_ref(), rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas };
+        let cx = Cx { ev, f: &p.frame, cur, nxt, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: self.cache.as_ref(), rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids, out };
         let f0 = self.n.fallbacks.get();
         let r = (p.run)(&cx, k);
         self.rec_on.set(false);
@@ -2743,7 +2768,7 @@ impl Plans {
                 return None;
             }
         };
-        let cx = Cx { ev, f: &p.frame, cur: s, nxt: &self.blank, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: None, rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas };
+        let cx = Cx { ev, f: &p.frame, cur: s, nxt: &self.blank, nv: nv as i64, fallbacks: &self.n.fallbacks, cache: None, rec_on: &self.rec_on, rec: &self.rec, cache_always: self.cache_always, meas: &self.meas, cur_ids: &[], out: None };
         let f0 = self.n.fallbacks.get();
         let r = (p.run)(&cx);
         p.use_.note(self.n.fallbacks.get() - f0);
@@ -2758,6 +2783,11 @@ impl Plans {
             }
         }
     }
+    /// Whether the step cache is on (it needs the ids of the current state).
+    #[inline]
+    pub fn caching(&self) -> bool {
+        self.cache.is_some()
+    }
     /// To be called before each state is expanded (the step cache measures the time between such calls).
     #[inline]
     pub fn tick(&self) {
@@ -2769,8 +2799,9 @@ impl Plans {
         if let Some(t) = &self.cache {
             let t = t.borrow();
             let off = self.units.iter().filter(|u| u.off.get()).count();
+            let m = t.memo.get();
             cache = format!(
-                "step cache: budget {:.1} MB, in use {:.1} MB (peak {:.1} MB); {} units, {} measured as not paying; {} lookups, {} hits ({:.2}%), {} stored, {} replaced, {} not stored for size, {} evaluations not cacheable\n",
+                "step cache: budget {:.1} MB, in use {:.1} MB (peak {:.1} MB); {} units, {} measured as not paying; {} lookups, {} hits ({:.2}%), {} stored, {} replaced, {} not stored for size, {} evaluations not cacheable; changes applied {} times, {} computed; locations looked up {} times, {} computed\n",
                 t.budget as f64 / 1048576.0,
                 t.used as f64 / 1048576.0,
                 t.peak as f64 / 1048576.0,
@@ -2782,7 +2813,11 @@ impl Plans {
                 t.n.stored,
                 t.n.replaced,
                 t.n.too_big,
-                t.n.uncacheable
+                t.n.uncacheable,
+                m[0],
+                m[1],
+                m[2],
+                m[3]
             );
             if std::env::var_os("EVERYSTATE_EVAL_DEBUG").is_some() {
                 for u in &self.units {
