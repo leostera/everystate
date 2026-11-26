@@ -78,11 +78,28 @@ pub struct ParConfig {
 }
 
 /// Open-addressing hash set of 64-bit fingerprints mapping to state ids.
+///
+/// One thread writes it while others may read it (the parallel search merges a level while the workers
+/// still look fingerprints up): a slot's id is stored before its key, which is stored with release
+/// ordering and read with acquire ordering, so a reader that finds a key finds its id. Growing needs
+/// `&mut`, so no reader is left; `put_shared` refuses to insert when it would have to grow.
 pub struct FpSet {
-    keys: Vec<u64>, // 0 = empty
-    ids: Vec<u32>,
-    size: usize,
+    keys: Box<[AtomicU64]>, // 0 = empty
+    ids: Box<[AtomicU32]>,
+    size: AtomicUsize,
     mask: usize,
+}
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as AtOrd};
+// (zeroed memory from the allocator, as `vec![0; n]` gets it: the pages are touched only when used)
+fn zeroed_u64(n: usize) -> Box<[AtomicU64]> {
+    let b = vec![0u64; n].into_boxed_slice();
+    // SAFETY: AtomicU64 has the same size, alignment and bit validity as u64
+    unsafe { Box::from_raw(Box::into_raw(b) as *mut [AtomicU64]) }
+}
+fn zeroed_u32(n: usize) -> Box<[AtomicU32]> {
+    let b = vec![0u32; n].into_boxed_slice();
+    // SAFETY: AtomicU32 has the same size, alignment and bit validity as u32
+    unsafe { Box::from_raw(Box::into_raw(b) as *mut [AtomicU32]) }
 }
 impl FpSet {
     pub fn new() -> FpSet {
@@ -90,23 +107,27 @@ impl FpSet {
     }
     /// `cap` must be a power of two.
     pub fn with_capacity(cap: usize) -> FpSet {
-        FpSet { keys: vec![0; cap], ids: vec![0; cap], size: 0, mask: cap - 1 }
+        FpSet { keys: zeroed_u64(cap), ids: zeroed_u32(cap), size: AtomicUsize::new(0), mask: cap - 1 }
     }
     pub fn len(&self) -> usize {
-        self.size
+        self.size.load(AtOrd::Relaxed)
+    }
+    #[inline]
+    fn key(fp: u64) -> u64 {
+        if fp == 0 { 0x9E37_79B9_7F4A_7C15 } else { fp }
     }
     /// The id stored for `fp`, without inserting.
     #[inline]
     pub fn get(&self, fp: u64) -> Option<u32> {
-        let fp = if fp == 0 { 0x9E37_79B9_7F4A_7C15 } else { fp };
+        let fp = Self::key(fp);
         let mut i = (fp as usize) & self.mask;
         loop {
-            let k = self.keys[i];
+            let k = self.keys[i].load(AtOrd::Acquire);
             if k == 0 {
                 return None;
             }
             if k == fp {
-                return Some(self.ids[i]);
+                return Some(self.ids[i].load(AtOrd::Relaxed));
             }
             i = (i + 1) & self.mask;
         }
@@ -114,21 +135,37 @@ impl FpSet {
     /// Returns the existing id, or None after inserting `id`.
     #[inline]
     pub fn put(&mut self, fp: u64, id: u32) -> Option<u32> {
-        if self.size * 2 >= self.keys.len() {
+        if *self.size.get_mut() * 2 >= self.keys.len() {
             self.grow();
         }
-        let fp = if fp == 0 { 0x9E37_79B9_7F4A_7C15 } else { fp };
+        self.insert(fp, id)
+    }
+    /// `put` while other threads may be reading; Err(()) when the set would have to grow first.
+    #[inline]
+    pub fn put_shared(&self, fp: u64, id: u32) -> Result<Option<u32>, ()> {
+        if self.size.load(AtOrd::Relaxed) * 2 >= self.keys.len() {
+            return match self.get(fp) {
+                Some(x) => Ok(Some(x)),
+                None => Err(()),
+            };
+        }
+        Ok(self.insert(fp, id))
+    }
+    /// (only one thread inserts at a time)
+    #[inline]
+    fn insert(&self, fp: u64, id: u32) -> Option<u32> {
+        let fp = Self::key(fp);
         let mut i = (fp as usize) & self.mask;
         loop {
-            let k = self.keys[i];
+            let k = self.keys[i].load(AtOrd::Relaxed);
             if k == 0 {
-                self.keys[i] = fp;
-                self.ids[i] = id;
-                self.size += 1;
+                self.ids[i].store(id, AtOrd::Relaxed);
+                self.keys[i].store(fp, AtOrd::Release);
+                self.size.fetch_add(1, AtOrd::Relaxed);
                 return None;
             }
             if k == fp {
-                return Some(self.ids[i]);
+                return Some(self.ids[i].load(AtOrd::Relaxed));
             }
             i = (i + 1) & self.mask;
         }
@@ -136,34 +173,28 @@ impl FpSet {
     /// Whether `fp` is in the set.
     #[inline]
     pub fn contains(&self, fp: u64) -> bool {
-        let fp = if fp == 0 { 0x9E37_79B9_7F4A_7C15 } else { fp };
-        let mut i = (fp as usize) & self.mask;
-        loop {
-            let k = self.keys[i];
-            if k == 0 {
-                return false;
-            }
-            if k == fp {
-                return true;
-            }
-            i = (i + 1) & self.mask;
-        }
+        self.get(fp).is_some()
+    }
+    /// Whether `more` insertions fit without growing.
+    pub fn room(&self, more: usize) -> bool {
+        (self.len() + more) * 2 < self.keys.len()
     }
     fn grow(&mut self) {
         let cap = self.keys.len() * 2;
-        let ok = std::mem::replace(&mut self.keys, vec![0; cap]);
-        let oi = std::mem::replace(&mut self.ids, vec![0; cap]);
+        let ok = std::mem::replace(&mut self.keys, zeroed_u64(cap));
+        let oi = std::mem::replace(&mut self.ids, zeroed_u32(cap));
         self.mask = cap - 1;
-        for (j, &k) in ok.iter().enumerate() {
+        for (j, k) in ok.iter().enumerate() {
+            let k = k.load(AtOrd::Relaxed);
             if k == 0 {
                 continue;
             }
             let mut i = (k as usize) & self.mask;
-            while self.keys[i] != 0 {
+            while *self.keys[i].get_mut() != 0 {
                 i = (i + 1) & self.mask;
             }
-            self.keys[i] = k;
-            self.ids[i] = oi[j];
+            *self.keys[i].get_mut() = k;
+            *self.ids[i].get_mut() = oi[j].load(AtOrd::Relaxed);
         }
     }
 }
@@ -332,7 +363,7 @@ impl IdStore {
     }
     fn values(&self, row: &[crate::hashcons::Id]) -> Vec<Value> {
         use crate::hashcons::NOT_INTERNED;
-        crate::hashcons::with_ids(|vals, _| row.iter().map(|&x| if x >= NOT_INTERNED { self.opaque[(x - NOT_INTERNED) as usize].clone() } else { vals[x as usize].clone() }).collect())
+        crate::hashcons::with_ids(|ids| row.iter().map(|&x| if x >= NOT_INTERNED { self.opaque[(x - NOT_INTERNED) as usize].clone() } else { ids.value(x) }).collect())
     }
     fn state(&self, i: usize) -> StateRef {
         StateData::new(self.values(self.row(i)))
@@ -667,6 +698,14 @@ impl<'a> Checker<'a> {
     pub(crate) fn is_flat(&self) -> bool {
         self.flat
     }
+    /// EVERYSTATE_EVAL_STATS: what the compiled evaluator and the step cache of this checker did.
+    pub(crate) fn eval_report(&self) -> Option<String> {
+        self.plans.as_ref().filter(|_| std::env::var_os("EVERYSTATE_EVAL_STATS").is_some()).map(|p| p.report())
+    }
+    /// The step cache is on: successors can be found as rows of ids (`successors_ids`).
+    pub(crate) fn caching(&self) -> bool {
+        self.plans.as_ref().is_some_and(|p| p.caching())
+    }
     /// The terms of `s`, for `row_fingerprint`. (The state was fingerprinted when it was found: the words
     /// of its values are cached.)
     pub(crate) fn parent_terms(&self, s: &StateRef, pt: &mut ParentTerms) -> R<()> {
@@ -700,11 +739,11 @@ impl<'a> Checker<'a> {
     /// The fingerprints of the successor rows of `s` (whose ids are `cur`), as `row_fingerprint` computes
     /// them from values: a changed variable is one whose id differs. None where a value has no word (the
     /// error is reported when the successor is fingerprinted from its values).
-    fn id_fingerprints(&self, s: &StateRef, cur: &[crate::hashcons::Id], pt: &ParentTerms, rows: &crate::stepcache::Rows, out: &mut Vec<Option<u64>>) {
+    pub(crate) fn id_fingerprints(&self, s: &StateRef, cur: &[crate::hashcons::Id], pt: &ParentTerms, rows: &crate::stepcache::Rows, out: &mut Vec<Option<u64>>) {
         use crate::hashcons::NOT_INTERNED;
         let nv = self.nvars;
         out.clear();
-        crate::hashcons::with_ids(|_, words| {
+        crate::hashcons::with_ids(|ids| {
             s.with(|pv| {
                 for row in rows.ids.chunks_exact(nv) {
                     let mut sum = pt.sum;
@@ -715,7 +754,7 @@ impl<'a> Checker<'a> {
                             continue;
                         }
                         let w = if x < NOT_INTERNED {
-                            words[x as usize]
+                            ids.word(x)
                         } else {
                             let v = &rows.opaque[(x - NOT_INTERNED) as usize];
                             if same_value(v, &pv[k]) {

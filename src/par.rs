@@ -45,7 +45,7 @@ use std::hash::{BuildHasherDefault, Hasher as StdHasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // ---------- serialized values ----------
 const T_FALSE: u8 = 0;
@@ -332,9 +332,14 @@ impl StdHasher for Fx {
     fn write_usize(&mut self, x: usize) {
         self.write_u64(x as u64);
     }
+    /// (mixed: the table takes its low bits, which a product alone leaves the same for keys that differ
+    /// only in their high bytes, as the encodings of numbers do)
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        let mut x = self.0;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^ (x >> 29)
     }
 }
 type FxBuild = BuildHasherDefault<Fx>;
@@ -551,7 +556,7 @@ struct Job {
     next: AtomicUsize,
     /// smallest position at which a worker stopped; states behind it are not expanded
     stop: AtomicUsize,
-    fps: Arc<RwLock<FpSet>>,
+    fps: Arc<FpSet>,
 }
 enum ToWorker {
     Level(Arc<Job>),
@@ -620,12 +625,31 @@ pub fn model_factory(root_name: String, cfg_text: String, sources: Vec<(String, 
     })
 }
 
+/// A level this large goes to the workers however long the search has run.
+const BIG_LEVEL: usize = 2048;
 const STACK: usize = 1 << 30;
 const UNSENDABLE: &str = "a state holds a value that cannot be passed between workers (a set defined by a predicate, or an operator)";
+
+/// macOS: a thread of the default quality of service may run on an efficiency core, which takes about
+/// twice as long; the level waits for its slowest worker.
+#[cfg(target_os = "macos")]
+fn prefer_fast_cores() {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    // SAFETY: sets an attribute of the calling thread only
+    unsafe {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn prefer_fast_cores() {}
 
 fn worker_main(factory: Arc<dyn Fn() -> R<Model> + Send + Sync>, flags: Flags, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
     set_stack_limit(STACK - (64 << 20));
     set_worker(true);
+    prefer_fast_cores();
     let model = match factory() {
         Ok(m) => m,
         Err(_) => {
@@ -646,11 +670,12 @@ fn worker_main(factory: Arc<dyn Fn() -> R<Model> + Send + Sync>, flags: Flags, r
     let mut acts: Vec<u32> = vec![];
     let mut scratch = Scratch::default();
     let nvars = model.vars.len();
+    let idmode = ck.is_flat() && !flags.record && ck.caching();
     while let Ok(ToWorker::Level(job)) = rx.recv() {
         // fingerprints this worker has met in this level
         let mut local = FpSet::with_capacity(1 << 10);
         {
-            let fps = job.fps.read().unwrap_or_else(|e| e.into_inner());
+            let fps = &*job.fps;
             let n = job.frontier.len();
             loop {
                 let start = job.next.fetch_add(1, Ordering::Relaxed).saturating_mul(job.chunk);
@@ -664,9 +689,9 @@ fn worker_main(factory: Arc<dyn Fn() -> R<Model> + Send + Sync>, flags: Flags, r
                         break;
                     }
                     let sb = job.frontier.get(i);
-                    let s = de.state(sb, nvars);
+                    let s = if idmode && !job.init { scratch.enc.state(&mut de, sb, nvars, &mut scratch.cur) } else { de.state(sb, nvars) };
                     let mark = (out.ent.len(), out.bytes.len());
-                    let mut event = if job.init { expand_init(&ck, &s, &mut local, &mut out) } else { expand(&ck, &s, sb, job.lvl, &fps, &mut local, &mut out, &mut succs, &mut acts, flags, &mut scratch) };
+                    let mut event = if job.init { expand_init(&ck, &s, &mut local, &mut out) } else { expand(&ck, &s, sb, job.lvl, fps, &mut local, &mut out, &mut succs, &mut acts, flags, &mut scratch) };
                     // an order-dependent operator decides, whatever else happened to the evaluation
                     if let Some(what) = take_impure() {
                         event = Some(Event::Fallback(format!("the specification uses {}", what)));
@@ -691,6 +716,9 @@ fn worker_main(factory: Arc<dyn Fn() -> R<Model> + Send + Sync>, flags: Flags, r
             return;
         }
     }
+    if let Some(r) = ck.eval_report() {
+        eprint!("{}: {}", std::thread::current().name().unwrap_or("worker"), r);
+    }
     // the process is about to end or goes on without this thread: nothing here is worth tearing down
     std::mem::forget(ck);
     std::mem::forget(model);
@@ -712,6 +740,9 @@ fn expand(ck: &Checker, s: &StateRef, sb: &[u8], lvl: u32, fps: &FpSet, local: &
         // invariants) only for a successor that may be new. There are no constraints and no action
         // properties in this mode.
         let nv = ck.model.vars.len();
+        if !scratch.cur.is_empty() {
+            return expand_ids(ck, s, sb, lvl, fps, local, out, flags, scratch);
+        }
         scratch.rows.clear();
         if ck.successors_flat(s, &mut scratch.rows, acts).is_err() {
             return Some(Event::Check);
@@ -822,6 +853,73 @@ fn expand(ck: &Checker, s: &StateRef, sb: &[u8], lvl: u32, fps: &FpSet, local: &
     None
 }
 
+/// `expand` in flat mode with the step cache: as the sequential search in id mode. The parent is interned
+/// (and rebuilt from the canonical values, which the step cache compares by identity), its successors are
+/// rows of ids, and a candidate is encoded from the parent's encoding and the values of the ids that
+/// differ.
+#[allow(clippy::too_many_arguments)]
+fn expand_ids(ck: &Checker, s: &StateRef, sb: &[u8], lvl: u32, fps: &FpSet, local: &mut FpSet, out: &mut ChunkOut, flags: Flags, scratch: &mut Scratch) -> Option<Event> {
+    use crate::hashcons::NOT_INTERNED;
+    let m = ck.model;
+    let ev = ck.ev;
+    let level = &ev.stats.level;
+    let nv = m.vars.len();
+    let cur = &mut scratch.cur;
+    if ck.successors_ids(s, cur, &scratch.idrows).is_err() {
+        return Some(Event::Check);
+    }
+    let extra = ev.extra_generated.replace(0);
+    let first = out.ent.len();
+    let rows = scratch.idrows.borrow();
+    let n = rows.act.len();
+    if n > 0 {
+        if ck.parent_terms(s, &mut scratch.terms).is_err() {
+            return Some(Event::Check);
+        }
+        ck.id_fingerprints(s, cur, &scratch.terms, &rows, &mut scratch.fps);
+        var_spans(sb, nv, &mut scratch.spans);
+    }
+    level.set(lvl as i64 + 1);
+    for i in 0..n {
+        let row = &rows.ids[i * nv..(i + 1) * nv];
+        let fp = match scratch.fps[i] {
+            Some(fp) => fp,
+            None => return Some(Event::Check),
+        };
+        if fps.get(fp).is_some() || local.put(fp, 0).is_some() {
+            continue;
+        }
+        let mark = out.bytes.len();
+        for k in 0..nv {
+            let x = row[k];
+            if x == cur[k] {
+                out.bytes.extend_from_slice(&sb[scratch.spans[k].0..scratch.spans[k].1]);
+            } else if x < NOT_INTERNED {
+                if !scratch.enc.encode(x, &mut out.bytes, &mut scratch.tmp) {
+                    return Some(Event::Fallback(UNSENDABLE.into()));
+                }
+            } else if !ser_var(&rows.value(x), &mut out.bytes, &mut scratch.tmp) {
+                return Some(Event::Fallback(UNSENDABLE.into()));
+            }
+        }
+        out.ent.push(Ent { fp, act: rows.act[i], kind: CAND, len: (out.bytes.len() - mark) as u32 });
+        if !m.invariants.is_empty() {
+            let t = StateData::new(row.iter().map(|&x| rows.value(x)).collect());
+            for ii in 0..m.invariants.len() {
+                if !matches!(ck.eval_invariant(ii, &t), Ok(true)) {
+                    return Some(Event::Check);
+                }
+            }
+        }
+    }
+    level.set(lvl as i64);
+    if n == 0 && flags.check_deadlock {
+        return Some(Event::Check);
+    }
+    out.src.push((n as u64 + extra, (out.ent.len() - first) as u32));
+    None
+}
+
 /// The same for a candidate initial state: constraints, fingerprint, invariants and implied initial
 /// predicates, as in `Checker::compute_init`.
 fn expand_init(ck: &Checker, s: &StateRef, local: &mut FpSet, out: &mut ChunkOut) -> Option<Event> {
@@ -858,19 +956,117 @@ fn expand_init(ck: &Checker, s: &StateRef, local: &mut FpSet, out: &mut ChunkOut
     None
 }
 
+/// A worker's memo of the encodings of the values it interned, both ways: decoding a variable it has met
+/// is a hash of its bytes, and encoding an id it has met is a copy.
+#[derive(Default)]
+struct Enc {
+    arena: Vec<u8>,
+    /// per id: where its variable encoding (length prefix included) is in `arena`; (0, 0) = not known
+    by_id: Vec<(u32, u32)>,
+    by_bytes: HashMap<Box<[u8]>, crate::hashcons::Id, FxBuild>,
+}
+impl Enc {
+    fn note(&mut self, x: crate::hashcons::Id, bytes: &[u8]) {
+        if crate::hashcons::is_immediate(x) {
+            return;
+        }
+        let i = x as usize;
+        if self.by_id.len() <= i {
+            self.by_id.resize(i + 1, (0, 0));
+        }
+        if self.by_id[i].1 == 0 && self.arena.len() + bytes.len() < u32::MAX as usize {
+            self.by_id[i] = (self.arena.len() as u32, bytes.len() as u32);
+            self.arena.extend_from_slice(bytes);
+        }
+    }
+    /// The state encoded in `b`, from canonical values; `cur` gets the ids of its variables
+    /// (`NOT_INTERNED` for a value that cannot be interned).
+    fn state(&mut self, de: &mut De, b: &[u8], nvars: usize, cur: &mut Vec<crate::hashcons::Id>) -> StateRef {
+        use crate::hashcons::NOT_INTERNED;
+        cur.clear();
+        let mut vals = Vec::with_capacity(nvars);
+        let mut pos = 0;
+        for _ in 0..nvars {
+            let start = pos;
+            let len = get_u(b, &mut pos) as usize;
+            let mut vpos = pos;
+            pos += len;
+            let span = &b[start..pos];
+            if len <= 9 {
+                // a scalar (or a small value): decoding it is cheaper than the memo
+                let v = de.value(b, &mut vpos);
+                match crate::hashcons::id(&v) {
+                    Some(x) => {
+                        cur.push(x);
+                        vals.push(crate::hashcons::value(x));
+                    }
+                    None => {
+                        cur.push(NOT_INTERNED);
+                        vals.push(v);
+                    }
+                }
+                continue;
+            }
+            if let Some(&x) = self.by_bytes.get(span) {
+                cur.push(x);
+                vals.push(crate::hashcons::value(x));
+                continue;
+            }
+            let v = de.value(b, &mut vpos);
+            match crate::hashcons::id(&v) {
+                Some(x) => {
+                    self.by_bytes.insert(span.into(), x);
+                    self.note(x, span);
+                    cur.push(x);
+                    vals.push(crate::hashcons::value(x));
+                }
+                None => {
+                    cur.push(NOT_INTERNED);
+                    vals.push(v);
+                }
+            }
+        }
+        StateData::new(vals)
+    }
+    /// Appends the variable encoding of the value with id `x`; false when it cannot be encoded.
+    fn encode(&mut self, x: crate::hashcons::Id, out: &mut Vec<u8>, tmp: &mut Vec<u8>) -> bool {
+        if crate::hashcons::is_immediate(x) {
+            return ser_var(&crate::hashcons::value(x), out, tmp);
+        }
+        if let Some(&(o, l)) = self.by_id.get(x as usize) {
+            if l > 0 {
+                out.extend_from_slice(&self.arena[o as usize..(o + l) as usize]);
+                return true;
+            }
+        }
+        let mark = out.len();
+        if !ser_var(&crate::hashcons::value(x), out, tmp) {
+            return false;
+        }
+        let bytes = out[mark..].to_vec();
+        self.note(x, &bytes);
+        true
+    }
+}
+
 #[derive(Default)]
 struct Scratch {
+    enc: Enc,
     spans: Vec<(usize, usize)>,
     tmp: Vec<u8>,
     /// flat mode: the variables of the successors of the state being expanded, and its fingerprint terms
     rows: Vec<Value>,
     terms: crate::checker::ParentTerms,
+    /// id mode: the ids of the parent, its successors, their fingerprints
+    cur: Vec<crate::hashcons::Id>,
+    idrows: RefCell<crate::stepcache::Rows>,
+    fps: Vec<Option<u64>>,
 }
 
 struct Engine {
     txs: Vec<Sender<ToWorker>>,
     rx: Receiver<FromWorker>,
-    fps: Arc<RwLock<FpSet>>,
+    fps: Arc<FpSet>,
 }
 impl Engine {
     fn start(cfg: &ParConfig, flags: Flags) -> Result<Engine, String> {
@@ -886,7 +1082,7 @@ impl Engine {
             txs.push(wtx);
         }
         drop(tx);
-        let eng = Engine { txs, rx, fps: Arc::new(RwLock::new(FpSet::with_capacity(2))) };
+        let eng = Engine { txs, rx, fps: Arc::new(FpSet::with_capacity(2)) };
         let mut failure = None;
         for _ in 0..cfg.workers {
             match eng.rx.recv() {
@@ -900,12 +1096,17 @@ impl Engine {
             None => Ok(eng),
         }
     }
-    /// Has the workers expand a level; the reports sorted by position, and where they stopped.
-    fn run(&mut self, init: bool, frontier: Arc<Batch>, lvl: u32, chunk: usize) -> (Vec<ChunkOut>, usize) {
+    /// Hands the workers a level (or the initial states); they report chunks, then `Done` each.
+    fn start_job(&mut self, init: bool, frontier: Arc<Batch>, lvl: u32, chunk: usize) -> Arc<Job> {
         let job = Arc::new(Job { init, frontier, lvl, chunk, next: AtomicUsize::new(0), stop: AtomicUsize::new(usize::MAX), fps: self.fps.clone() });
         for tx in &self.txs {
             tx.send(ToWorker::Level(job.clone())).expect("a worker thread stopped unexpectedly");
         }
+        job
+    }
+    /// Has the workers expand a level; the reports sorted by position, and where they stopped.
+    fn run(&mut self, init: bool, frontier: Arc<Batch>, lvl: u32, chunk: usize) -> (Vec<ChunkOut>, usize) {
+        let job = self.start_job(init, frontier, lvl, chunk);
         let mut chunks = vec![];
         let mut done = 0;
         while done < self.txs.len() {
@@ -928,6 +1129,71 @@ impl Drop for Engine {
 }
 
 // ---------- the main thread ----------
+/// Merges the first `upto` states of a chunk of the level starting at state `a`: new states get ids (in
+/// order), their encodings go to `found`. `put` and `get` are the fingerprint set.
+#[allow(clippy::too_many_arguments)]
+fn merge_chunk(ck: &mut Checker, de: &RefCell<De>, c: &ChunkOut, upto: usize, a: usize, lvl: u32, record: bool, found: &mut Batch, put: &mut dyn FnMut(u64, u32) -> Option<u32>, get: &dyn Fn(u64) -> Option<u32>) {
+    let nvars = ck.model.vars.len();
+    let (mut ei, mut boff) = (0, 0);
+    for k in 0..upto {
+        let sid = a + c.start + k;
+        let (generated, entries) = c.src[k];
+        ck.generated += generated;
+        let mut fresh = 0u32;
+        for _ in 0..entries {
+            let e = &c.ent[ei];
+            ei += 1;
+            let bytes = &c.bytes[boff..boff + e.len as usize];
+            boff += e.len as usize;
+            let id = match e.kind {
+                CAND => {
+                    let nid = ck.states.len() as u32;
+                    match put(e.fp, nid) {
+                        None => {
+                            ck.states.push(ck.empty.clone());
+                            ck.parent.push(sid as u32);
+                            ck.level.push(lvl + 1);
+                            ck.act.push(e.act as i32);
+                            if record {
+                                ck.succ.push(vec![]);
+                                ck.succ_act.push(vec![]);
+                                if let Some(ss) = &mut ck.succ_state {
+                                    ss.push(vec![]);
+                                }
+                            }
+                            found.bytes.extend_from_slice(bytes);
+                            found.offs.push(found.bytes.len());
+                            fresh += 1;
+                            nid
+                        }
+                        Some(ex) => ex,
+                    }
+                }
+                DUP => get(e.fp).expect("parallel search: a duplicate without its original"),
+                _ => e.fp as u32,
+            };
+            if record {
+                ck.succ[sid].push(id);
+                ck.succ_act[sid].push(e.act);
+                if let Some(ss) = &mut ck.succ_state {
+                    ss[sid].push(de.borrow_mut().state(bytes, nvars));
+                }
+            }
+        }
+        ck.outdeg.push(fresh);
+    }
+}
+/// `merge_chunk` into the checker's own fingerprint set.
+#[allow(clippy::too_many_arguments)]
+fn merge_chunk_seq(ck: &mut Checker, de: &RefCell<De>, c: &ChunkOut, upto: usize, a: usize, lvl: u32, record: bool, found: &mut Batch) {
+    let mut fps = std::mem::replace(&mut ck.fps, FpSet::with_capacity(2));
+    {
+        let cell = RefCell::new(&mut fps);
+        merge_chunk(ck, de, c, upto, a, lvl, record, found, &mut |fp, id| cell.borrow_mut().put(fp, id), &|fp| cell.borrow().get(fp));
+    }
+    ck.fps = fps;
+}
+
 /// The parallel side of a `Checker`.
 pub struct Par {
     cfg: ParConfig,
@@ -1051,12 +1317,13 @@ impl Par {
         self.materialize(ck, ck.head);
     }
 
-    /// Whether `n` states are worth handing to the workers; starts them when they are.
+    /// Whether `n` states are worth handing to the workers; starts them when they are. (Starting them
+    /// takes a few milliseconds; a level of `BIG_LEVEL` states takes longer than that on one thread.)
     fn ready(&mut self, ck: &mut Checker, events: &mut dyn Events, n: usize) -> bool {
         if !self.off && crate::eval::WORKERS.load(Ordering::Relaxed) < 2 {
             self.give_up(ck, events, "the specification reads TLCGet(\"config\")");
         }
-        if self.off || n < self.cfg.min_frontier || !(self.cfg.eager || ck.ev.host.borrow().now_ms() - self.t0 >= 50.0) {
+        if self.off || n < self.cfg.min_frontier || !(self.cfg.eager || n >= BIG_LEVEL || ck.ev.host.borrow().now_ms() - self.t0 >= 50.0) {
             return false;
         }
         if self.engine.is_none() {
@@ -1096,10 +1363,10 @@ impl Par {
         }
         let chunk = self.chunk(n);
         let eng = self.engine.as_mut().unwrap();
-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+        std::mem::swap(&mut ck.fps, Arc::get_mut(&mut eng.fps).expect("parallel search: the fingerprint set is still shared"));
         let (chunks, stop) = eng.run(true, frontier.clone(), 1, chunk);
         let eng = self.engine.as_mut().unwrap();
-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
+        std::mem::swap(&mut ck.fps, Arc::get_mut(&mut eng.fps).expect("parallel search: the fingerprint set is still shared"));
         let t2 = ck.ev.host.borrow().now_ms();
         self.times.1 += t2 - t1;
         let p = stop.min(n);
@@ -1203,77 +1470,69 @@ impl Par {
             self.times.0 = t1 - self.t0;
         }
         let eng = self.engine.as_mut().unwrap();
-        // the workers read the fingerprint set while they run; nobody writes
-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
-        let (chunks, stop) = eng.run(false, frontier, lvl, chunk);
-        let eng = self.engine.as_mut().unwrap();
-        std::mem::swap(&mut ck.fps, &mut *eng.fps.write().unwrap_or_else(|e| e.into_inner()));
-
-        let t2 = ck.ev.host.borrow().now_ms();
-        self.times.1 += t2 - t1;
-        // merge, in state order, everything before the first state a worker stopped at
-        let p = stop.min(n);
+        // The workers read the fingerprint set while they run, and the chunks they finish are merged
+        // meanwhile, in state order, into the same set (which has room for them; see `FpSet`). A chunk
+        // is merged early only when it and every chunk before it are whole; the rest waits for the end
+        // of the level, when it is known where the workers stopped. So does the rest of the level once
+        // the set has no room left without growing, which it can do only when nobody reads it.
+        let fps_now = Arc::get_mut(&mut eng.fps).expect("parallel search: the fingerprint set is still shared");
+        std::mem::swap(&mut ck.fps, fps_now);
+        let job = eng.start_job(false, frontier, lvl, chunk);
         let record = ck.opts.record_graph;
         let mut found = Batch::new(b);
         let mut pos = 0;
+        let mut pending: std::collections::BTreeMap<usize, ChunkOut> = Default::default();
+        let mut early = true;
+        let mut merge_ms = 0.0;
+        let mut done = 0;
+        while done < eng.txs.len() {
+            match eng.rx.recv().expect("a worker thread stopped unexpectedly") {
+                FromWorker::Chunk(c) => {
+                    pending.insert(c.start, c);
+                }
+                FromWorker::Done => done += 1,
+                FromWorker::Ready(_) => {}
+            }
+            while early {
+                let whole = match pending.get(&pos) {
+                    Some(c) => c.event.is_none() && c.done == chunk.min(n - c.start),
+                    None => break,
+                };
+                let c = pending.remove(&pos).unwrap();
+                let cands = c.ent.iter().filter(|e| e.kind == CAND).count();
+                if !whole || !job.fps.room(cands) {
+                    pending.insert(c.start, c);
+                    early = false;
+                    break;
+                }
+                let tm = ck.ev.host.borrow().now_ms();
+                merge_chunk(ck, &self.de, &c, c.done, a, lvl, record, &mut found, &mut |fp, id| job.fps.put_shared(fp, id).expect("parallel search: no room in the fingerprint set"), &|fp| job.fps.get(fp));
+                merge_ms += ck.ev.host.borrow().now_ms() - tm;
+                pos += c.done;
+            }
+        }
+        let stop = job.stop.load(Ordering::Relaxed);
+        drop(job);
+        let eng = self.engine.as_mut().unwrap();
+        let fps_now = Arc::get_mut(&mut eng.fps).expect("parallel search: the fingerprint set is still shared");
+        std::mem::swap(&mut ck.fps, fps_now);
+
+        let t2 = ck.ev.host.borrow().now_ms();
+        self.times.1 += t2 - t1;
+        self.times.2 += merge_ms;
+        // merge, in state order, everything before the first state a worker stopped at
+        let p = stop.min(n);
         let mut event: Option<Event> = None;
-        for c in chunks {
+        for (_, mut c) in pending {
             if c.start + c.done == p && c.event.is_some() {
-                event = c.event;
+                event = c.event.take();
             }
             if c.start >= p {
                 continue;
             }
             assert_eq!(c.start, pos, "parallel search: a part of the level is missing");
             let upto = c.done.min(p - c.start);
-            let (mut ei, mut boff) = (0, 0);
-            for k in 0..upto {
-                let sid = a + c.start + k;
-                let (generated, entries) = c.src[k];
-                ck.generated += generated;
-                let mut fresh = 0u32;
-                for _ in 0..entries {
-                    let e = &c.ent[ei];
-                    ei += 1;
-                    let bytes = &c.bytes[boff..boff + e.len as usize];
-                    boff += e.len as usize;
-                    let id = match e.kind {
-                        CAND => {
-                            let nid = ck.states.len() as u32;
-                            match ck.fps.put(e.fp, nid) {
-                                None => {
-                                    ck.states.push(ck.empty.clone());
-                                    ck.parent.push(sid as u32);
-                                    ck.level.push(lvl + 1);
-                                    ck.act.push(e.act as i32);
-                                    if record {
-                                        ck.succ.push(vec![]);
-                                        ck.succ_act.push(vec![]);
-                                        if let Some(ss) = &mut ck.succ_state {
-                                            ss.push(vec![]);
-                                        }
-                                    }
-                                    found.bytes.extend_from_slice(bytes);
-                                    found.offs.push(found.bytes.len());
-                                    fresh += 1;
-                                    nid
-                                }
-                                Some(ex) => ex,
-                            }
-                        }
-                        DUP => ck.fps.get(e.fp).expect("parallel search: a duplicate without its original"),
-                        _ => e.fp as u32,
-                    };
-                    if record {
-                        ck.succ[sid].push(id);
-                        ck.succ_act[sid].push(e.act);
-                        if let Some(ss) = &mut ck.succ_state {
-                            ss[sid].push(self.de.borrow_mut().state(bytes, nvars));
-                        }
-                    }
-                }
-                ck.outdeg.push(fresh);
-            }
+            merge_chunk_seq(ck, &self.de, &c, upto, a, lvl, record, &mut found);
             pos += upto;
         }
         assert_eq!(pos, p, "parallel search: a part of the level is missing");

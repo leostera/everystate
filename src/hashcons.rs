@@ -35,6 +35,32 @@ static NEXT_EPOCH: AtomicU32 = AtomicU32::new(1);
 pub type Id = u32;
 /// Ids from here on are not ids of the table: users mark values that cannot be interned with them.
 pub const NOT_INTERNED: Id = 1 << 31;
+/// Ids from here to `NOT_INTERNED` are *immediate*: the value is in the id (a Boolean, or an integer
+/// within `IMM_INT`), with no entry in the table. Integers are most of the scalars a search meets, and a
+/// counter can take millions of values; this way they cost neither a probe nor memory.
+pub const IMMEDIATE: Id = 1 << 30;
+/// integers `-IMM_INT ..= IMM_INT - 1` are immediate
+const IMM_INT: i64 = 1 << 28;
+
+/// The immediate id of `v`, if it has one.
+#[inline]
+fn immediate(v: &Value) -> Option<Id> {
+    match v {
+        Value::Bool(b) => Some(IMMEDIATE + *b as Id),
+        Value::Int(i) if (-IMM_INT..IMM_INT).contains(i) => Some(IMMEDIATE + 2 + (*i + IMM_INT) as Id),
+        _ => None,
+    }
+}
+/// The value of an immediate id.
+#[inline]
+fn immediate_value(x: Id) -> Value {
+    debug_assert!((IMMEDIATE..NOT_INTERNED).contains(&x));
+    match x - IMMEDIATE {
+        0 => Value::Bool(false),
+        1 => Value::Bool(true),
+        k => Value::Int((k - 2) as i64 - IMM_INT),
+    }
+}
 
 struct Table {
     /// tag bits of this table's nodes: the epoch, shifted into the high half
@@ -91,6 +117,9 @@ impl Table {
 
     /// The id of the canonical value equal to `v` (interning it, scalars included).
     fn id(&mut self, v: &Value) -> Option<Id> {
+        if let Some(x) = immediate(v) {
+            return Some(x);
+        }
         let c = match v {
             Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Model(_) => return Some(self.scalar_id(v)),
             _ => self.canon(v)?,
@@ -116,7 +145,7 @@ impl Table {
 
     fn insert_at(&mut self, slot: usize, node: Value, w: u64) -> usize {
         let id = self.vals.len();
-        assert!(id < NOT_INTERNED as usize, "more than 2^31 distinct values");
+        assert!(id < IMMEDIATE as usize, "more than 2^30 distinct values");
         self.slots[slot] = id as u32;
         self.vals.push(node);
         self.words.push(w);
@@ -269,6 +298,9 @@ pub fn id(v: &Value) -> Option<Id> {
 /// The id of `v` when it is a canonical composite of this thread's table (no interning, no borrow).
 #[inline]
 pub fn id_if_canonical(v: &Value) -> Option<Id> {
+    if let Some(x) = immediate(v) {
+        return Some(x);
+    }
     let t = tag(v);
     if is_current(t) {
         Some(t as Id)
@@ -280,22 +312,49 @@ pub fn id_if_canonical(v: &Value) -> Option<Id> {
 /// The value with id `id` (a shared reference to the canonical node).
 #[inline]
 pub fn value(id: Id) -> Value {
+    if id >= IMMEDIATE {
+        return immediate_value(id);
+    }
     TABLE.with(|t| t.borrow().vals[id as usize].clone())
 }
 
 /// The fingerprint word (`value_word`) of the value with id `id`.
 #[inline]
 pub fn word(id: Id) -> u64 {
+    if id >= IMMEDIATE {
+        return value_word(&immediate_value(id)).expect("a scalar has a word");
+    }
     TABLE.with(|t| t.borrow().words[id as usize])
 }
 
-/// Runs `f` with read access to the values and words by id (for loops over many ids). `f` must not
-/// intern anything.
+/// Whether `id` is immediate (its value is in it; see `IMMEDIATE`).
 #[inline]
-pub fn with_ids<T>(f: impl FnOnce(&[Value], &[u64]) -> T) -> T {
+pub fn is_immediate(id: Id) -> bool {
+    (IMMEDIATE..NOT_INTERNED).contains(&id)
+}
+
+/// Read access to the values and words by id, for loops over many ids (`with_ids`).
+pub struct Ids<'a> {
+    vals: &'a [Value],
+    words: &'a [u64],
+}
+impl Ids<'_> {
+    #[inline]
+    pub fn value(&self, id: Id) -> Value {
+        if id >= IMMEDIATE { immediate_value(id) } else { self.vals[id as usize].clone() }
+    }
+    #[inline]
+    pub fn word(&self, id: Id) -> u64 {
+        if id >= IMMEDIATE { value_word(&immediate_value(id)).expect("a scalar has a word") } else { self.words[id as usize] }
+    }
+}
+
+/// Runs `f` with read access to the values and words by id. `f` must not intern anything.
+#[inline]
+pub fn with_ids<T>(f: impl FnOnce(&Ids) -> T) -> T {
     TABLE.with(|t| {
         let t = t.borrow();
-        f(&t.vals, &t.words)
+        f(&Ids { vals: &t.vals, words: &t.words })
     })
 }
 
